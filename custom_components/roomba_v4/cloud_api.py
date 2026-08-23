@@ -1864,6 +1864,19 @@ class IRobotCloudApi:
             if not filtered:
                 continue
             before = json.dumps(source_state, sort_keys=True, default=str)
+
+            if mode == "livemap":
+                new_ts = (filtered.get("livemap") or {}).get("path_timestamp")
+                old_ts = (source_state.get("livemap") or {}).get("path_timestamp")
+
+                if isinstance(new_ts, (int, float)) and isinstance(old_ts, (int, float)):
+                    if new_ts < old_ts:
+                        _LOGGER.debug(
+                            "Ignoring stale livemap update: timestamp=%s < current=%s",
+                            new_ts, old_ts,
+                        )
+                        continue
+
             self._deep_merge_dict(source_state, filtered)
             after = json.dumps(source_state, sort_keys=True, default=str)
             if before != after:
@@ -2501,11 +2514,11 @@ class IRobotCloudApi:
                             })
                             if connack.get("type") != 2 or connack.get("return_code") not in {0, None}:
                                 raise CloudApiError(f"bad connack: {connack}")
-    
+
                             idle_packets: list[dict[str, Any]] = []
                             attempt["idle_packets"] = idle_packets[:10]
                             attempt["phase"] = "subscribe_sequence"
-    
+
                             packet_id = 1
                             subscribe_results: list[dict[str, Any]] = []
                             subscribe_observed: list[dict[str, Any]] = []
@@ -2592,7 +2605,7 @@ class IRobotCloudApi:
                             attempt["subscribe_observed"] = subscribe_observed[-20:]
                             attempt["phase"] = "subscribed"
                             self._subscriber_ready.set()
-    
+
                             await self._log_event_status({
                                 "status": "subscribed",
                                 "transport": "v144_post_command_shadow_refresh",
@@ -2604,7 +2617,7 @@ class IRobotCloudApi:
                                 "connect_variant": connect_variant.get("name"),
                                 "cycle": cycle,
                             })
-    
+
                             topic_hits: dict[str, int] = {}
                             first_messages: list[dict[str, Any]] = []
                             warmup_packets = await self._capture_post_connack_idle(ws, seconds=2.0, phase="post_subscribe_warmup")
@@ -2619,7 +2632,7 @@ class IRobotCloudApi:
                                         "payload_text_prefix": payload_text[:512] if isinstance(payload_text, str) else None,
                                         "payload_json": packet.get("payload_json", packet),
                                     })
-    
+
                             safe_trigger_result = None
 
                             await self._write_runtime_debug("cloud_topic_hits", {
@@ -2644,7 +2657,7 @@ class IRobotCloudApi:
                                     "header_variant": header_name,
                                     "result": safe_trigger_result,
                                 })
-    
+
                             connected = True
                             attempt["phase"] = "steady_state"
                             attempt["steady_state_entered_at"] = datetime.now(tz=UTC).isoformat()
@@ -2657,7 +2670,7 @@ class IRobotCloudApi:
                                 "topic_sequences": topic_sequences,
                                 "attempt": attempt,
                             })
-    
+
                             idle_cycles = 0
                             bootstrap_sent = False
                             while not self._subscriber_stop.is_set():
@@ -3016,7 +3029,7 @@ class IRobotCloudApi:
                             if connack.get("type") != 2 or connack.get("return_code") not in {0, None}:
                                 connection_attempts.append(conn_info)
                                 continue
-    
+
                             publish_attempts: list[dict[str, Any]] = []
                             for topic in topics:
                                 for variant_name, body in payload_variants:
