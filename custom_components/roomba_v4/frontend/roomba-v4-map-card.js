@@ -430,8 +430,12 @@ class RoombaV4MapCard extends HTMLElement {
 
   _roomClass(id, current, completed, inPlan) {
     let cls = "room";
-    if (this._mode === "exclude" && this._selected.has(id)) cls += " excluded";
-    else if (this._mode === "select" && this._selected.has(id)) cls += " selected";
+    const selected = this._selected.has(id);
+    const willClean = this._mode === "all" ||
+      (this._mode === "select" && selected) ||
+      (this._mode === "exclude" && !selected);
+    if (this._mode === "exclude" && selected) cls += " excluded";
+    else if (willClean) cls += " selected";
     if (inPlan.has(id)) cls += " in-plan";
     if (completed.has(id)) cls += " completed";
     if (current !== null && current !== undefined && String(current) === id) cls += " current";
@@ -460,8 +464,12 @@ class RoombaV4MapCard extends HTMLElement {
       const id = String(room.id);
       const chip = document.createElement("button");
       chip.className = "chip";
-      if (this._mode === "exclude" && this._selected.has(id)) chip.classList.add("excluded");
-      else if (this._mode === "select" && this._selected.has(id)) chip.classList.add("selected");
+      const selected = this._selected.has(id);
+      const willClean = this._mode === "all" ||
+        (this._mode === "select" && selected) ||
+        (this._mode === "exclude" && !selected);
+      if (this._mode === "exclude" && selected) chip.classList.add("excluded");
+      else if (willClean) chip.classList.add("selected");
       if (completed.has(id)) chip.classList.add("completed");
       if (current !== null && current !== undefined && String(current) === id) chip.classList.add("current");
       chip.dataset.action = "toggle-room";
@@ -682,6 +690,8 @@ class RoombaV4MapCard extends HTMLElement {
     if (target === this._els.routineSelect) {
       this._selectedRoutine = target.value;
       this._saveLocalState();
+      if (this._selectedRoutine) this._applyRoutine(true);
+      else this._update();
       return;
     }
     const role = target.dataset.role || "";
@@ -717,7 +727,7 @@ class RoombaV4MapCard extends HTMLElement {
     this._update();
   }
 
-  _applyRoutine() {
+  _applyRoutine(silent = false) {
     const name = this._selectedRoutine;
     const state = this._entityState();
     if (!name || !state) return;
@@ -739,7 +749,7 @@ class RoombaV4MapCard extends HTMLElement {
     this._saveLocalState();
     this._keys = {};
     this._update();
-    this._setNotice(`Rutina aplicada: ${name}`);
+    if (!silent) this._setNotice(`Rutina aplicada: ${name}`);
   }
 
   async _saveRoutine() {
