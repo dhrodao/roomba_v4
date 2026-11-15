@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  unit:
+    name: Pure unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pure test dependencies
+        run: pip install pytest Pillow
+      - name: Run pure unit tests
+        run: pytest -ra
+
+  hass:
+    name: Home Assistant integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install HA test environment
+        run: pip install -r requirements_test.txt
+      - name: Run HA-marked tests
+        run: pytest -ra -m hass

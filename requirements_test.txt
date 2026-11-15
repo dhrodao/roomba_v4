@@ -1,0 +1,17 @@
+# Test dependencies for the roomba_v4 integration.
+#
+# Pure unit tier (runs without Home Assistant):
+#   pip install pytest Pillow
+#   pytest            # hass-marked tests are skipped automatically
+#
+# Home Assistant integration tier (runs @pytest.mark.hass tests):
+#   pip install -r requirements_test.txt
+#   pytest -m hass
+#
+# pytest-homeassistant-custom-component is pinned to one Home Assistant release.
+# The versions below were verified together (HA 2025.1.4). Bump both lines in
+# lockstep when upgrading.
+pytest>=8.0
+Pillow>=10.0
+websockets>=14.0
+pytest-homeassistant-custom-component==0.13.205
