@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from pathlib import Path
@@ -44,8 +45,8 @@ FRONTEND_REGISTERED = f"{DOMAIN}_frontend_registered"
 async def _async_register_frontend(hass: HomeAssistant) -> None:
     if hass.data.get(FRONTEND_REGISTERED):
         return
-    hass.data[FRONTEND_REGISTERED] = True
     card_dir = Path(__file__).parent / "frontend"
+    static_ok = False
     try:
         if StaticPathConfig is not None and hasattr(hass.http, "async_register_static_paths"):
             await hass.http.async_register_static_paths([
@@ -53,12 +54,31 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
             ])
         else:
             hass.http.register_static_path("/roomba_v4", str(card_dir), cache_headers=False)
+        static_ok = True
     except Exception as err:
         _LOGGER.warning("roomba_v4: unable to register map card static path: %s", err)
+    module_ok = False
     try:
-        add_extra_js_url(hass, CARD_URL)
+        result = add_extra_js_url(hass, CARD_URL)
+        if inspect.isawaitable(result):
+            await result
+        module_ok = True
     except Exception as err:
         _LOGGER.warning("roomba_v4: unable to register map card frontend module: %s", err)
+        try:
+            extra_modules = hass.data.get("frontend_extra_module_url")
+            if extra_modules is not None:
+                extra_modules.add(CARD_URL)
+            else:
+                hass.data.setdefault("frontend_extra_module_url", set()).add(CARD_URL)
+            module_ok = True
+        except Exception as fallback_err:
+            _LOGGER.warning("roomba_v4: frontend module fallback failed: %s", fallback_err)
+    if static_ok and module_ok:
+        hass.data[FRONTEND_REGISTERED] = True
+        _LOGGER.info("roomba_v4: map card registered at %s", CARD_URL)
+    else:
+        _LOGGER.warning("roomba_v4: map card registration incomplete (static=%s, module=%s)", static_ok, module_ok)
 
 
 def _target_coordinator(hass: HomeAssistant, call: ServiceCall) -> RoombaV4Coordinator:
