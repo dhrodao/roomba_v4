@@ -1,5 +1,6 @@
 const ROOMBA_CARD_TYPE = "roomba-v4-map-card";
 const ROOMBA_DOMAIN = "roomba_v4";
+const ROOMBA_CARD_VERSION = "4.1.3";
 
 const ROOM_COLORS = [
   "#4e79a7",
@@ -864,4 +865,9 @@ if (!window.customCards.some((card) => card.type === ROOMBA_CARD_TYPE)) {
     description: "Interactive iRobot map with room selection, routines and live mission progress.",
     preview: false,
   });
+  console.info(
+    `%c ROOMBA-V4-MAP-CARD %c ${ROOMBA_CARD_VERSION} `,
+    "color:white;background:#4e79a7;font-weight:700",
+    "color:#4e79a7;background:white;font-weight:700",
+  );
 }

@@ -16,6 +16,8 @@ ACTIVE_UPDATE_INTERVAL = timedelta(seconds=20)
 IDLE_UPDATE_INTERVAL = timedelta(minutes=2)
 DOCKED_UPDATE_INTERVAL = timedelta(minutes=10)
 
+MAX_MAP_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
 EVENT_TYPE = "roomba_v4_event"
 LIVE_STATUS_DEBUG_DIR = ".storage/roomba_v4_debug/{entry_id}"
 LEGACY_DEBUG_DIR = ".storage/roomba_v4_debug"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -10,13 +11,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.service import async_call_from_config
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .cloud_api import CloudApiError, IRobotCloudApi
-from .const import ACTIVE_UPDATE_INTERVAL, DOCKED_UPDATE_INTERVAL, EVENT_TYPE, IDLE_UPDATE_INTERVAL, STORAGE_KEY_PREFIX, STORAGE_VERSION, UPDATE_INTERVAL
+from .cloud_api import AuthenticationError, CloudApiError, IRobotCloudApi
+from .const import ACTIVE_UPDATE_INTERVAL, DOCKED_UPDATE_INTERVAL, DOMAIN, EVENT_TYPE, IDLE_UPDATE_INTERVAL, STORAGE_KEY_PREFIX, STORAGE_VERSION, UPDATE_INTERVAL
 from .debug import get_debug_dir, get_legacy_debug_dir
 from .freshness import telemetry_freshness
 from .map_renderer import extract_map_render_metadata, extract_room_info_from_archive, geometry_polygons, room_names_from_info, render_archive_to_png_bytes
@@ -80,7 +82,13 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.auto_download_map = auto_download_map
         self.s3_map_url = s3_map_url
         self.debug_enabled = debug_enabled
-        self.map_archive_path = self.hass.config.path(f".storage/roomba_v4_{entry_id}_livemap.tgz")
+        # Store downloaded map archives under a dedicated integration directory.
+        # The ``.storage`` folder is reserved for Home Assistant's own JSON stores,
+        # so binary ``.tgz`` archives should not live there.
+        self.map_archive_path = self.hass.config.path(DOMAIN, f"{entry_id}_livemap.tgz")
+        self._legacy_map_archive_path = self.hass.config.path(
+            f".storage/roomba_v4_{entry_id}_livemap.tgz"
+        )
         self.debug_dir = get_debug_dir(self.hass, entry_id)
         self.legacy_debug_dir = get_legacy_debug_dir(self.hass)
         self.map_png_bytes: bytes | None = None
@@ -95,7 +103,6 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}.{entry_id}")
         self._restored = False
         self._restored_data: dict[str, Any] = {}
-        self._subscriber_bootstrap_task = None
         self._subscriber_boot_task = None
         self._livemap_trigger_task = None
         self._last_livemap_trigger_at: datetime | None = None
@@ -155,38 +162,30 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         preferred = str((self.data or self._restored_data or {}).get("preferred_water_level") or "").strip()
         return preferred if preferred in self.water_level_options() else (self.water_level_options()[0] if self.water_level_options() else None)
 
+    async def _async_store_preference(self, key: str, option: str) -> None:
+        """Persist a user preference to both live data and the restore cache."""
+        base = dict(self.data or self._restored_data or {})
+        base[key] = option
+        self._restored_data = dict(base)
+        if isinstance(self.data, dict):
+            self.data[key] = option
+        await self.store.async_save(base)
+        self.async_update_listeners()
+
     async def async_set_preferred_cleaning_mode(self, option: str) -> None:
         if option not in self.cleaning_mode_options():
             raise CloudApiError(f"Unsupported cleaning mode: {option}")
-        base = dict(self.data or self._restored_data or {})
-        base["preferred_cleaning_mode"] = option
-        self._restored_data = dict(base)
-        if isinstance(self.data, dict):
-            self.data["preferred_cleaning_mode"] = option
-        await self.store.async_save(base)
-        self.async_update_listeners()
+        await self._async_store_preference("preferred_cleaning_mode", option)
 
     async def async_set_preferred_suction_level(self, option: str) -> None:
         if option not in self.suction_level_options():
             raise CloudApiError(f"Unsupported suction level: {option}")
-        base = dict(self.data or self._restored_data or {})
-        base["preferred_suction_level"] = option
-        self._restored_data = dict(base)
-        if isinstance(self.data, dict):
-            self.data["preferred_suction_level"] = option
-        await self.store.async_save(base)
-        self.async_update_listeners()
+        await self._async_store_preference("preferred_suction_level", option)
 
     async def async_set_preferred_water_level(self, option: str) -> None:
         if option not in self.water_level_options():
             raise CloudApiError(f"Unsupported water level: {option}")
-        base = dict(self.data or self._restored_data or {})
-        base["preferred_water_level"] = option
-        self._restored_data = dict(base)
-        if isinstance(self.data, dict):
-            self.data["preferred_water_level"] = option
-        await self.store.async_save(base)
-        self.async_update_listeners()
+        await self._async_store_preference("preferred_water_level", option)
 
     def current_operating_mode_value(self) -> int | None:
         live_state = (self.data or self._restored_data or {}).get("live_state") or {}
@@ -383,38 +382,6 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         base["_event_state"] = event_state
         self._restored_data = dict(base)
 
-    async def async_start_background_subscriber(self) -> None:
-        if self._subscriber_bootstrap_task and not self._subscriber_bootstrap_task.done():
-            return
-
-        async def _runner() -> None:
-            try:
-                self.api.debug_dir = self.debug_dir if self.debug_enabled else None
-                if self.debug_enabled:
-                    self.legacy_debug_dir.mkdir(parents=True, exist_ok=True)
-                if not self.api.robots:
-                    await self.api.authenticate()
-                await self.api.async_ensure_event_subscriber(self.robot_blid)
-            except Exception as err:
-                _LOGGER.debug("roomba_v4 always-on subscriber bootstrap failed: %s", err, exc_info=True)
-                try:
-                    await self.api._write_runtime_debug("mqtt_bootstrap_error", {
-                        "robot_id": self.robot_blid,
-                        "error": str(err),
-                    })
-                except Exception:
-                    pass
-
-        self._subscriber_bootstrap_task = self.hass.async_create_task(_runner())
-
-    def _deep_merge(self, base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-        for key, value in incoming.items():
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                self._deep_merge(base[key], value)
-            else:
-                base[key] = value
-        return base
-
     def _is_definitely_docked(self, live_state: dict[str, Any]) -> bool:
         cms = live_state.get("cleanMissionStatus") or {}
         phase = str(cms.get("phase") or "").lower()
@@ -494,6 +461,13 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         bin_state = live_state.get("bin") if isinstance(live_state.get("bin"), dict) else {}
         meta = live_state.get("_meta") if isinstance(live_state.get("_meta"), dict) else {}
         previous_status = previous_status or {}
+        operating_mode = cms.get("operatingMode")
+        if operating_mode is None:
+            operating_mode = live_state.get("operatingMode")
+        try:
+            operating_mode = int(operating_mode) if operating_mode is not None else None
+        except (TypeError, ValueError):
+            operating_mode = None
         status = {
             "battery": live_state.get("batPct"),
             "mission_phase": cms.get("phase"),
@@ -512,7 +486,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             "bin_full": bin_state.get("full"),
             "tank_present": live_state.get("tankPresent"),
             "detected_pad": live_state.get("detectedPad"),
-            "operating_mode": self.current_operating_mode_value() if live_state is (self.data or self._restored_data or {}).get("live_state") else (lambda cms, ls: (int(cms.get("operatingMode") or ls.get("operatingMode")) if (cms.get("operatingMode") or ls.get("operatingMode")) is not None else None))(cms, live_state),
+            "operating_mode": operating_mode,
             "wifi_rssi": signal.get("rssi"),
             "wifi_snr": signal.get("snr"),
             "last_topic": meta.get("last_topic"),
@@ -1028,14 +1002,14 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
 
             effective_url = self.s3_map_url or self._extract_map_url(robot, active_map, mission_history)
             url_candidates = self._deep_find_candidates({"robot": robot, "active_map": active_map, "mission_history": mission_history, "pmaps": pmaps})
-            await self._write_debug_json("url_candidates.json", url_candidates)
+            await self._write_debug_json("url_candidates.json", self._redact_url_candidates(url_candidates))
             if effective_url:
-                await self._write_debug_text("extracted_map_url.txt", effective_url)
+                await self._write_debug_text("extracted_map_url.txt", self._redact_url(effective_url))
 
             map_download_state: dict[str, Any] = {
                 "attempted": False,
                 "method": None,
-                "url": effective_url,
+                "url": self._redact_url(effective_url),
                 "p2map_id": active_map_id,
                 "p2mapv_id": active_map_version,
             }
@@ -1149,16 +1123,30 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             self._apply_update_interval(vacuum_state)
             await self._write_debug_aliases()
             return data
+        except AuthenticationError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
         except CloudApiError as err:
             raise UpdateFailed(str(err)) from err
 
     async def async_shutdown(self) -> None:
         self.api.remove_live_state_listener(self._handle_live_state_update)
+        tasks = [
+            task
+            for task in (self._subscriber_boot_task, self._livemap_trigger_task)
+            if task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._subscriber_boot_task = None
+        self._livemap_trigger_task = None
 
     async def _restore_state_once(self) -> None:
         if self._restored:
             return
         self._restored = True
+        await self.hass.async_add_executor_job(self._migrate_legacy_archive)
         restored = await self.store.async_load() or {}
         self._restored_data = restored if isinstance(restored, dict) else {}
         self.last_map_refresh = self._restored_data.get("last_map_refresh")
@@ -1454,6 +1442,26 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         (self.debug_dir / filename).write_text(text, encoding="utf-8")
 
+    @staticmethod
+    def _redact_url(value: Any) -> Any:
+        """Strip the query string from signed URLs so debug files keep no secrets."""
+        if not isinstance(value, str) or "://" not in value:
+            return value
+        base, sep, query = value.partition("?")
+        if not sep or not query:
+            return value
+        keys = sorted({pair.split("=", 1)[0] for pair in query.split("&") if pair})
+        return f"{base}?<redacted:{','.join(keys)}>"
+
+    def _redact_url_candidates(self, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+        redacted: list[dict[str, str]] = []
+        for item in candidates:
+            if isinstance(item, dict):
+                redacted.append({**item, "value": self._redact_url(item.get("value"))})
+            else:
+                redacted.append(item)
+        return redacted
+
     def _deep_find_candidates(self, obj: Any, out: list[dict[str, str]] | None = None, path: str = "$") -> list[dict[str, str]]:
         if out is None:
             out = []
@@ -1601,12 +1609,24 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         archive.parent.mkdir(parents=True, exist_ok=True)
         archive.write_bytes(content)
 
+    def _migrate_legacy_archive(self) -> None:
+        """Move a map archive previously stored under ``.storage`` to its new home."""
+        legacy = Path(self._legacy_map_archive_path)
+        target = Path(self.map_archive_path)
+        try:
+            if not legacy.exists() or target.exists():
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            legacy.replace(target)
+            _LOGGER.debug("roomba_v4 migrated map archive from %s to %s", legacy, target)
+        except OSError as err:
+            _LOGGER.debug("roomba_v4 legacy archive migration skipped: %s", err)
+
     async def async_refresh_map_from_archive(self, archive_path: str | Path, *, show_labels: bool = True, show_coverage: bool = True) -> None:
         archive = Path(archive_path)
         if not archive.exists():
             _LOGGER.warning("Map archive does not exist yet: %s", archive)
             return
-        self.map_archive_path = str(archive)
         self.map_png_bytes = await self.hass.async_add_executor_job(render_archive_to_png_bytes, archive, show_labels, show_coverage)
         self.room_info = await self.hass.async_add_executor_job(extract_room_info_from_archive, archive)
         self._room_polygons_checked = False
@@ -1620,28 +1640,6 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
     async def async_refresh_map_from_url(self, url: str) -> None:
         self.s3_map_url = url
         await self.async_download_and_render_map(url)
-
-    def _find_routine_commanddef(self, *, name_loc_key: str | None = None, routine_type: str | None = None, friendly_name: str | None = None) -> dict[str, Any] | None:
-        routines = (self.data or {}).get("routines") or self._restored_data.get("routines") or []
-        for routine in routines:
-            if not isinstance(routine, dict):
-                continue
-            if name_loc_key and routine.get("name_loc_key") == name_loc_key:
-                defs = routine.get("commanddefs") or []
-                if defs and isinstance(defs[0], dict):
-                    return defs[0]
-            if friendly_name and str(routine.get("name") or "").strip().lower() == friendly_name.strip().lower():
-                defs = routine.get("commanddefs") or []
-                if defs and isinstance(defs[0], dict):
-                    return defs[0]
-            defs = routine.get("commanddefs") or []
-            for commanddef in defs:
-                if not isinstance(commanddef, dict):
-                    continue
-                params = commanddef.get("params") or {}
-                if routine_type and str(params.get("routine_type") or "").upper() == routine_type.upper():
-                    return commanddef
-        return None
 
     def _resolve_selected_room_entry(self) -> dict[str, Any] | None:
         selected = self.selected_room
@@ -2089,9 +2087,10 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         if not requested:
             raise CloudApiError("No rooms supplied")
 
-        robot_state = self.data.get("robot") if isinstance(self.data, dict) else None
-        p2map_id = (self.data.get("active_map_id") if isinstance(self.data, dict) else None) or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
-        pmapv_id = (self.data.get("active_map_version") if isinstance(self.data, dict) else None) or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None))
+        data = self.data or self._restored_data or {}
+        robot_state = data.get("robot") if isinstance(data.get("robot"), dict) else None
+        p2map_id = data.get("active_map_id") or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
+        pmapv_id = data.get("active_map_version") or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None))
 
         regions: list[dict[str, Any]] = []
         resolved: list[dict[str, Any]] = []
@@ -2501,7 +2500,8 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
     async def async_dump_room_debug(self) -> dict[str, Any]:
         room = self._resolve_selected_room_entry()
         region_candidates = self._room_region_candidates(room) if room else []
-        robot_state = self.data.get("robot") if isinstance(self.data, dict) else None
+        data = self.data or self._restored_data or {}
+        robot_state = data.get("robot") if isinstance(data.get("robot"), dict) else None
         payload = {
             "selected_room": self.selected_room,
             "rooms": self.rooms,
@@ -2510,8 +2510,8 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             "selected_room_entry": room,
             "region_candidates": region_candidates,
             "feature_context": self._room_feature_context(room, region_candidates) if room else None,
-            "active_map_id": (self.data.get("active_map_id") if isinstance(self.data, dict) else None),
-            "active_map_version": (self.data.get("active_map_version") if isinstance(self.data, dict) else None),
+            "active_map_id": data.get("active_map_id"),
+            "active_map_version": data.get("active_map_version"),
             "robot_map_ids": robot_state if isinstance(robot_state, dict) else None,
             "cloud_transport_debug": self.api.get_cloud_transport_debug_info(self.robot_blid),
         }
@@ -2536,9 +2536,10 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         if not region_candidates:
             raise CloudApiError(f"No region id candidates found for room {self.selected_room}")
 
-        robot_state = self.data.get("robot") if isinstance(self.data, dict) else None
-        p2map_id = (self.data.get("active_map_id") if isinstance(self.data, dict) else None) or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
-        pmapv_id = (self.data.get("active_map_version") if isinstance(self.data, dict) else None) or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None))
+        data = self.data or self._restored_data or {}
+        robot_state = data.get("robot") if isinstance(data.get("robot"), dict) else None
+        p2map_id = data.get("active_map_id") or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
+        pmapv_id = data.get("active_map_version") or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None))
         feature_ctx = self._room_feature_context(room, region_candidates)
         region_id = str(region_candidates[0])
         region_params = self._build_region_cleaning_params(region_id)
@@ -2574,10 +2575,10 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             "schema_name": schema_name,
             "feature_context": feature_ctx,
             "robot_state_map_ids": {
-                "p2map_id": (self.data.get("active_map_id") if isinstance(self.data, dict) else None),
-                "user_p2mapv_id": (self.data.get("active_map_version") if isinstance(self.data, dict) else None),
-                "robot_p2map_id": ((self.data.get("robot") or {}).get("p2map_id") if isinstance(self.data, dict) and isinstance(self.data.get("robot"), dict) else None),
-                "robot_user_p2mapv_id": ((((self.data.get("robot") or {}).get("user_p2mapv_id")) or ((self.data.get("robot") or {}).get("pmapv_id"))) if isinstance(self.data, dict) and isinstance(self.data.get("robot"), dict) else None),
+                "p2map_id": data.get("active_map_id"),
+                "user_p2mapv_id": data.get("active_map_version"),
+                "robot_p2map_id": (robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None,
+                "robot_user_p2mapv_id": ((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None,
             },
             "commanddef": commanddef,
         })
@@ -2587,9 +2588,10 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         return result
 
     def _build_clean_all_commanddef(self) -> dict[str, Any]:
-        robot_state = self.data.get("robot") if isinstance(self.data, dict) else None
-        p2map_id = (self.data.get("active_map_id") if isinstance(self.data, dict) else None) or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
-        pmapv_id = (self.data.get("active_map_version") if isinstance(self.data, dict) else None) or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None))
+        data = self.data or self._restored_data or {}
+        robot_state = data.get("robot") if isinstance(data.get("robot"), dict) else None
+        p2map_id = (data.get("active_map_id") or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None))
+        pmapv_id = (data.get("active_map_version") or ((((robot_state or {}).get("user_p2mapv_id") or (robot_state or {}).get("pmapv_id")) if isinstance(robot_state, dict) else None)))
         params = self._build_top_level_cleaning_params()
         operating_mode = self._preferred_operating_mode_value()
         if operating_mode is not None:

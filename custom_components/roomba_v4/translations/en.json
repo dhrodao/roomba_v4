@@ -17,13 +17,40 @@
         "data": {
           "robot_blid": "Robot"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate iRobot Cloud",
+        "description": "Update the credentials for this robot.",
+        "data": {
+          "username": "Email",
+          "password": "Password",
+          "country_code": "Country code"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid authentication",
       "cannot_connect": "Cannot connect",
       "unknown": "Unexpected error",
-      "no_robots": "No robots were found on this account"
+      "no_robots": "No robots were found on this account",
+      "robot_not_found": "The configured robot was not found on this account"
+    },
+    "abort": {
+      "reauth_failed": "Reauthentication failed",
+      "reauth_successful": "Reauthentication was successful",
+      "already_configured": "This robot is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Roomba v4 options",
+        "description": "Adjust how this robot behaves.",
+        "data": {
+          "auto_download_map": "Auto-download map when available",
+          "debug_enabled": "Enable debug logging"
+        }
+      }
     }
   }
 }

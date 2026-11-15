@@ -7,8 +7,8 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.data_entry_flow import AbortFlow, FlowResult
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .cloud_api import AuthenticationError, CloudApiError, IRobotCloudApi
 from .const import CONF_AUTO_DOWNLOAD_MAP, CONF_COUNTRY_CODE, CONF_DEBUG_ENABLED, CONF_ROBOT_BLID, DEFAULT_COUNTRY_CODE, DOMAIN
@@ -52,12 +52,13 @@ class RoombaV4ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._user_input: dict[str, Any] = {}
         self._robots: dict[str, dict[str, Any]] = {}
+        self._reauth_entry: config_entries.ConfigEntry | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             self._user_input = user_input
-            session = async_create_clientsession(self.hass)
+            session = async_get_clientsession(self.hass)
             api = IRobotCloudApi(
                 username=user_input[CONF_USERNAME],
                 password=user_input[CONF_PASSWORD],
@@ -73,6 +74,8 @@ class RoombaV4ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 elif len(self._robots) == 1:
                     return await self._create_entry(next(iter(self._robots)))
                 return await self.async_step_select_robot()
+            except AbortFlow:
+                raise
             except AuthenticationError:
                 errors["base"] = "invalid_auth"
             except CloudApiError as err:
@@ -100,6 +103,55 @@ class RoombaV4ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             robot_options[blid] = f"{name} ({sku})"
         schema = vol.Schema({vol.Required(CONF_ROBOT_BLID): vol.In(robot_options)})
         return self.async_show_form(step_id="select_robot", data_schema=schema)
+
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
+        self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        entry = self._reauth_entry
+        if entry is None:
+            return self.async_abort(reason="reauth_failed")
+        if user_input is not None:
+            api = IRobotCloudApi(
+                username=user_input[CONF_USERNAME],
+                password=user_input[CONF_PASSWORD],
+                country_code=user_input.get(CONF_COUNTRY_CODE, entry.data.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE)),
+                session=async_get_clientsession(self.hass),
+            )
+            try:
+                await api.authenticate()
+            except AuthenticationError:
+                errors["base"] = "invalid_auth"
+            except CloudApiError as err:
+                _LOGGER.exception("Cloud API error during reauthentication: %s", err)
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error during reauthentication")
+                errors["base"] = "unknown"
+            else:
+                blid = entry.data.get(CONF_ROBOT_BLID)
+                if blid and api.robots and blid not in api.robots:
+                    errors["base"] = "robot_not_found"
+                else:
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data={
+                            **entry.data,
+                            CONF_USERNAME: user_input[CONF_USERNAME],
+                            CONF_PASSWORD: user_input[CONF_PASSWORD],
+                            CONF_COUNTRY_CODE: user_input.get(CONF_COUNTRY_CODE, entry.data.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE)),
+                            "cloud_client_config": dict(api.config),
+                        },
+                    )
+
+        schema = vol.Schema({
+            vol.Required(CONF_USERNAME, default=entry.data.get(CONF_USERNAME, "")): str,
+            vol.Required(CONF_PASSWORD): str,
+            vol.Optional(CONF_COUNTRY_CODE, default=entry.data.get(CONF_COUNTRY_CODE, DEFAULT_COUNTRY_CODE)): str,
+        })
+        return self.async_show_form(step_id="reauth_confirm", data_schema=schema, errors=errors)
 
     async def _create_entry(self, blid: str) -> FlowResult:
         await self.async_set_unique_id(blid)

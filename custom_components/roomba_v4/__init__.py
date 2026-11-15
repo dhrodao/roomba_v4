@@ -38,7 +38,32 @@ SERVICE_RUN_ROUTINE = "run_routine"
 SERVICE_SKIP_ROOM = "skip_room"
 SERVICE_MISSION_COMMAND = "mission_command"
 
-CARD_URL = "/roomba_v4/roomba-v4-map-card.js"
+def _card_url() -> str:
+    """Build the card URL with a cache-busting version.
+
+    Prefer the integration's manifest version so the query parameter changes on
+    every release. Fall back to the file's modification time when the manifest
+    cannot be read.
+    """
+    base = Path(__file__).parent
+    version: str | int
+    try:
+        import json
+
+        manifest = json.loads((base / "manifest.json").read_text(encoding="utf-8"))
+        version = str(manifest.get("version") or "").strip()
+    except (OSError, ValueError):
+        version = ""
+    if not version:
+        card = base / "frontend" / "roomba-v4-map-card.js"
+        try:
+            version = int(card.stat().st_mtime)
+        except OSError:
+            version = 1
+    return f"/roomba_v4/roomba-v4-map-card.js?v={version}"
+
+
+CARD_URL = _card_url()
 FRONTEND_REGISTERED = f"{DOMAIN}_frontend_registered"
 
 
@@ -94,8 +119,53 @@ def _target_coordinator(hass: HomeAssistant, call: ServiceCall) -> RoombaV4Coord
     raise vol.Invalid("Specify entry_id to select which robot should handle this service")
 
 
+def _target_coordinators(hass: HomeAssistant, call: ServiceCall) -> list[RoombaV4Coordinator]:
+    entry_id = call.data.get("entry_id")
+    coordinators = hass.data.get(DOMAIN) or {}
+    if entry_id:
+        coordinator = coordinators.get(entry_id)
+        if coordinator is None:
+            raise vol.Invalid(f"Unknown roomba_v4 entry_id: {entry_id}")
+        return [coordinator]
+    return list(coordinators.values())
+
+
+def _validate_local_archive(hass: HomeAssistant, archive_path: str) -> Path:
+    config_dir = Path(hass.config.config_dir).resolve()
+    path = Path(archive_path).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    candidate = path.resolve()
+    if not candidate.is_relative_to(config_dir):
+        raise vol.Invalid("archive_path must be inside the Home Assistant config directory")
+    return candidate
+
+
+def _validate_http_url(url: str) -> None:
+    if not url.startswith(("http://", "https://")):
+        raise vol.Invalid("url must use http or https")
+
+
 async def _async_reload_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+def _async_unregister_services(hass: HomeAssistant) -> None:
+    for service in (
+        SERVICE_REFRESH_MAP_FROM_ARCHIVE,
+        SERVICE_REFRESH_MAP_FROM_URL,
+        SERVICE_CLEAR_PATH_HISTORY,
+        SERVICE_CLEAN_ROOM,
+        SERVICE_SPOT_CLEAN,
+        SERVICE_CLEAN_ROOMS,
+        SERVICE_SAVE_ROUTINE,
+        SERVICE_DELETE_ROUTINE,
+        SERVICE_RUN_ROUTINE,
+        SERVICE_SKIP_ROOM,
+        SERVICE_MISSION_COMMAND,
+    ):
+        if hass.services.has_service(DOMAIN, service):
+            hass.services.async_remove(DOMAIN, service)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> bool:
@@ -135,10 +205,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> 
 
     if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_MAP_FROM_ARCHIVE):
         async def _handle_refresh_archive(call: ServiceCall) -> None:
-            archive_path = call.data["archive_path"]
+            archive_path = _validate_local_archive(hass, call.data["archive_path"])
             show_labels = call.data.get("show_labels", True)
             show_coverage = call.data.get("show_coverage", True)
-            for stored_coordinator in hass.data[DOMAIN].values():
+            for stored_coordinator in _target_coordinators(hass, call):
                 await stored_coordinator.async_refresh_map_from_archive(archive_path, show_labels=show_labels, show_coverage=show_coverage)
 
         hass.services.async_register(
@@ -149,40 +219,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> 
                 vol.Required("archive_path"): str,
                 vol.Optional("show_labels", default=True): bool,
                 vol.Optional("show_coverage", default=True): bool,
+                vol.Optional("entry_id"): str,
             }),
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_MAP_FROM_URL):
         async def _handle_refresh_url(call: ServiceCall) -> None:
             url = call.data["url"]
-            for stored_coordinator in hass.data[DOMAIN].values():
+            _validate_http_url(url)
+            for stored_coordinator in _target_coordinators(hass, call):
                 await stored_coordinator.async_refresh_map_from_url(url)
 
         hass.services.async_register(
             DOMAIN,
             SERVICE_REFRESH_MAP_FROM_URL,
             _handle_refresh_url,
-            schema=vol.Schema({vol.Required("url"): str}),
+            schema=vol.Schema({
+                vol.Required("url"): str,
+                vol.Optional("entry_id"): str,
+            }),
         )
 
 
     if not hass.services.has_service(DOMAIN, SERVICE_CLEAN_ROOM):
         async def _handle_clean_room(call: ServiceCall) -> None:
             room_name = call.data["room_name"]
-            target_entry_id = call.data.get("entry_id")
-            coordinators = hass.data[DOMAIN].values()
-            if target_entry_id:
-                coordinator = hass.data[DOMAIN].get(target_entry_id)
-                if coordinator is None:
-                    raise vol.Invalid(f"Unknown roomba_v4 entry_id: {target_entry_id}")
-                coordinators = [coordinator]
-            handled = False
-            for stored_coordinator in coordinators:
-                if room_name in (stored_coordinator.rooms or []):
-                    await stored_coordinator.async_clean_room_by_name(room_name)
-                    handled = True
-            if not handled:
+            coordinators = _target_coordinators(hass, call)
+            matches = [
+                stored_coordinator
+                for stored_coordinator in coordinators
+                if room_name in (stored_coordinator.rooms or [])
+            ]
+            if not matches:
                 raise vol.Invalid(f"Room not found in available roomba_v4 coordinators: {room_name}")
+            if len(matches) > 1:
+                raise vol.Invalid(
+                    f"Room {room_name!r} exists on multiple robots; specify entry_id"
+                )
+            await matches[0].async_clean_room_by_name(room_name)
 
         hass.services.async_register(
             DOMAIN,
@@ -196,16 +270,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> 
 
     if not hass.services.has_service(DOMAIN, SERVICE_SPOT_CLEAN):
         async def _handle_spot_clean(call: ServiceCall) -> None:
-            entry_id = call.data.get("entry_id")
-            coordinators = hass.data[DOMAIN]
-            if entry_id:
-                coordinator = coordinators.get(entry_id)
-                if coordinator is None:
-                    raise vol.Invalid("Unknown Roomba entry")
-            elif len(coordinators) == 1:
-                coordinator = next(iter(coordinators.values()))
-            else:
-                raise vol.Invalid("Specify entry_id to select which robot should clean the spot")
+            coordinator = _target_coordinator(hass, call)
             await coordinator.async_spot_clean(call.data["x"], call.data["y"])
 
         hass.services.async_register(
@@ -347,4 +412,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) ->
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data[DOMAIN]:
+            _async_unregister_services(hass)
     return unload_ok

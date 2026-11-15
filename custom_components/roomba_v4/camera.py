@@ -836,11 +836,6 @@ class RoombaV4MapCamera(RoombaV4Entity, Camera):
             self._clear_return_path()
         raw_path_points = livemap.get("cumulative_path_points") if livemap.get("trail_format") == 2 and isinstance(livemap.get("cumulative_path_points"), list) else []
         local_path_points = self._update_local_path(status, vacuum_position, charger_position)
-        mission_id = (live_state.get("cleanMissionStatus") or {}).get("missionId")
-        if mission_id and mission_id != self._trail_mission_id and _vacuum_state_lower(data, status) == "cleaning":
-            self._trail_mission_id = mission_id
-            self._cleaning_trail = []
-            self._clear_return_path()
         if _vacuum_state_lower(data, status) == "cleaning" or not self._cleaning_trail:
             self._cleaning_trail = _filter_path_points(raw_path_points or local_path_points)
         path_points = [point for point in self._cleaning_trail if point.get("flag") != 0]
@@ -887,11 +882,6 @@ class RoombaV4MapCamera(RoombaV4Entity, Camera):
             self._clear_return_path()
         raw_path_points = livemap.get("cumulative_path_points") if livemap.get("trail_format") == 2 and isinstance(livemap.get("cumulative_path_points"), list) else []
         local_path_points = self._update_local_path(status, vacuum_position, charger_position)
-        mission_id = (live_state.get("cleanMissionStatus") or {}).get("missionId")
-        if mission_id and mission_id != self._trail_mission_id and _vacuum_state_lower(data, status) == "cleaning":
-            self._trail_mission_id = mission_id
-            self._cleaning_trail = []
-            self._clear_return_path()
         if _vacuum_state_lower(data, status) == "cleaning" or not self._cleaning_trail:
             self._cleaning_trail = _filter_path_points(raw_path_points or local_path_points)
         path_points = [point for point in self._cleaning_trail if point.get("flag") != 0]

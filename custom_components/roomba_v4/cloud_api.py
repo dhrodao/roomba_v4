@@ -19,7 +19,7 @@ import aiohttp
 import websockets
 from websockets.datastructures import Headers
 
-from .const import API_USER_AGENT, AWS_USER_AGENT
+from .const import API_USER_AGENT, AWS_USER_AGENT, MAX_MAP_DOWNLOAD_BYTES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -477,45 +477,6 @@ class IRobotCloudApi:
             return mqtt_topic
         return None
 
-    async def _aws_json_request(
-        self,
-        url: str,
-        *,
-        method: str = "POST",
-        payload_obj: dict[str, Any] | list[Any] | None = None,
-        params: dict[str, Any] | None = None,
-        accept: str = "application/json",
-    ) -> tuple[int, Any, str]:
-        if not self.credentials:
-            raise AuthenticationError("Not authenticated")
-        payload = json.dumps(payload_obj or {}, separators=(",", ":"))
-        region = self.credentials["CognitoId"].split(":")[0]
-        parsed = urllib.parse.urlparse(url)
-        signing_host, signing_path, final_url = self._resolve_execute_api_target(url)
-        signer = AWSSignatureV4(
-            access_key_id=self.credentials["AccessKeyId"],
-            secret_access_key=self.credentials["SecretKey"],
-            session_token=self.credentials["SessionToken"],
-        )
-        headers = signer.generate_signed_headers(
-            method=method,
-            service="execute-api",
-            region=region,
-            host=signing_host,
-            path=signing_path,
-            query_params=params or {},
-            headers={"accept": accept, "content-type": "application/json", "user-agent": AWS_USER_AGENT},
-            payload=payload,
-        )
-        final_url = final_url if not params else f"{final_url}?{urllib.parse.urlencode(params)}"
-        async with self.session.request(method.upper(), final_url, headers=headers, data=payload.encode("utf-8")) as resp:
-            txt = await resp.text()
-            try:
-                data = json.loads(txt) if txt else {}
-            except JSONDecodeError:
-                data = {"raw": txt}
-            return resp.status, data, txt
-
     async def _aws_request_bytes(
         self,
         url: str,
@@ -686,11 +647,27 @@ class IRobotCloudApi:
         return await self._aws_request(f"{self.deployment['httpBaseAuth']}/v1/user/automations")
 
     async def download_file(self, url: str) -> bytes:
-        async with self.session.get(url) as resp:
+        if not url.startswith(("http://", "https://")):
+            raise CloudApiError(f"Unsupported map URL scheme: {url[:120]}")
+        timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+        async with self.session.get(url, timeout=timeout) as resp:
             if resp.status != 200:
                 txt = await resp.text()
                 raise CloudApiError(f"Download failed ({resp.status}): {txt[:300]}")
-            return await resp.read()
+            if resp.content_length and resp.content_length > MAX_MAP_DOWNLOAD_BYTES:
+                raise CloudApiError(
+                    f"Map download is too large ({resp.content_length} bytes)"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > MAX_MAP_DOWNLOAD_BYTES:
+                    raise CloudApiError(
+                        f"Map download exceeded {MAX_MAP_DOWNLOAD_BYTES} bytes"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
 
 
     def _redact_url_query_keys(self, url: str) -> dict[str, Any]:
@@ -997,14 +974,14 @@ class IRobotCloudApi:
         for uname_name, username, password, key_names in usernames:
             for protocol_level in (4, 3):
                 for client_id in filtered_client_ids:
-                    info={"transport":"tls_mqtt_custom_authorizer","client_id":client_id,"username_variant":uname_name,"username_preview":username[:120],"password":("<set>" if password else None),"token_keys":key_names,"protocol_level":protocol_level}
+                    info={"transport":"tls_mqtt_custom_authorizer","client_id":client_id,"username_variant":uname_name,"username":("<set>" if username else None),"password":("<set>" if password else None),"token_keys":key_names,"protocol_level":protocol_level}
                     _LOGGER.debug("v60 TLS MQTT attempt client_id=%s username_variant=%s proto=%s", client_id, uname_name, protocol_level)
                     try:
                         reader, writer = await asyncio.wait_for(asyncio.open_connection(endpoint, 443, ssl=ssl_context, server_hostname=endpoint), timeout=8.0)
                         try:
                             _LOGGER.debug("v60 TLS MQTT connected client_id=%s username_variant=%s proto=%s", client_id, uname_name, protocol_level)
                             connect_packet = self._mqtt_connect_packet(client_id, username=username, password=password, protocol_level=protocol_level)
-                            _LOGGER.debug("v60 CONNECT HEX client_id=%s username_variant=%s proto=%s hex=%s", client_id, uname_name, protocol_level, self._hex_bytes(connect_packet))
+                            _LOGGER.debug("v60 CONNECT prepared client_id=%s username_variant=%s proto=%s packet_len=%s", client_id, uname_name, protocol_level, len(connect_packet))
                             writer.write(connect_packet)
                             await writer.drain()
                             _LOGGER.debug("v60 TLS MQTT CONNECT sent client_id=%s username_variant=%s proto=%s", client_id, uname_name, protocol_level)
@@ -1949,7 +1926,7 @@ class IRobotCloudApi:
         await self._notify_live_state_listeners()
 
     async def _write_runtime_debug(self, stage: str, data: dict[str, Any]) -> str:
-        path = "/tmp/roomba_v4_last_debug.json"
+        path = ""
         if self.debug_dir:
             try:
                 out = self.debug_dir / f"runtime_{stage}.json"
@@ -1961,7 +1938,6 @@ class IRobotCloudApi:
                 path = await asyncio.to_thread(_write)
             except Exception as err:
                 _LOGGER.debug("roomba_v4 runtime debug write failed stage=%s err=%s", stage, err)
-        _LOGGER.debug("v111 debug snapshot stage=%s path=%s", stage, path)
         return path
 
     def _event_debug_path(self, filename: str) -> Path | None:
@@ -1969,22 +1945,6 @@ class IRobotCloudApi:
             return None
         return self.debug_dir / filename
 
-
-    def _merge_live_state_from_packet(self, packet: dict[str, Any] | None) -> None:
-        """Compat helper for older subscriber paths that expect a sync packet handler."""
-        if not isinstance(packet, dict):
-            return
-        if packet.get("type") != 3:
-            return
-        payload = packet.get("payload_json")
-        if not isinstance(payload, dict):
-            return
-        topic = packet.get("topic")
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self._ingest_live_state_payload(topic, payload))
 
     async def _append_event_packet(self, packet: dict[str, Any]) -> None:
         if packet.get("type") == "message":
@@ -2514,18 +2474,14 @@ class IRobotCloudApi:
                             attempt["phase"] = "mqtt_connect_sent"
                             attempt["connected_at"] = datetime.now(tz=UTC).isoformat()
                             connect_packet = self._mqtt_connect_packet(client_id, username=mqtt_username, password=mqtt_password, keepalive=300)
-                            attempt["connect_hex"] = self._hex_bytes(connect_packet)
-                            await self._write_packet_hex_trace("mqtt_packet_hex_trace", {
+                            await self._write_runtime_debug("mqtt_connect_sent", {
                                 "cycle": cycle,
                                 "client_id": client_id,
                                 "url_variant": candidate["url_name"],
                                 "header_variant": header_name,
-                                "phase": "mqtt_connect_sent",
-                                "packet_type": "CONNECT",
                                 "connect_variant": connect_variant.get("name"),
                                 "mqtt_username": ("<empty>" if mqtt_username == "" else ("<set>" if mqtt_username is not None else None)),
                                 "mqtt_password": ("<set>" if mqtt_password is not None else None),
-                                "packet_hex": self._hex_bytes(connect_packet),
                                 "packet_len": len(connect_packet),
                             })
                             await ws.send(connect_packet)
@@ -3399,7 +3355,10 @@ class IRobotCloudApi:
         if isinstance(robot, dict):
             for key, value in robot.items():
                 if "mqtt" in key.lower() or "iot" in key.lower() or key.lower() in {"password", "blid", "sku", "softwarever", "svcdeplid"}:
-                    mqtt_candidates[key] = value
+                    if key.lower() == "password" and isinstance(value, str):
+                        mqtt_candidates[key] = "<redacted>"
+                    else:
+                        mqtt_candidates[key] = value
 
         if isinstance(deployment, dict):
             for key, value in deployment.items():

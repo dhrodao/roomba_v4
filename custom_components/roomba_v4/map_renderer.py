@@ -12,6 +12,26 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 
+def _safe_extract_tar(tf: tarfile.TarFile, destination: Path) -> None:
+    """Extract regular files/directories, rejecting paths outside destination."""
+    root = destination.resolve()
+    members: list[tarfile.TarInfo] = []
+    for member in tf.getmembers():
+        target = (root / member.name).resolve()
+        if target != root and root not in target.parents:
+            raise ValueError(f"Archive member escapes destination: {member.name}")
+        if member.issym() or member.islnk():
+            raise ValueError(f"Archive links are not allowed: {member.name}")
+        if not (member.isfile() or member.isdir()):
+            continue
+        members.append(member)
+
+    if hasattr(tarfile, "data_filter"):
+        tf.extractall(root, members=members, filter="data")
+    else:  # Python < 3.12
+        tf.extractall(root, members=members)
+
+
 def _ring_to_points(ring: Any) -> list[list[float]]:
     points: list[list[float]] = []
     if not isinstance(ring, (list, tuple)):
@@ -56,7 +76,7 @@ def extract_room_info_from_archive(archive_path: str | Path) -> list[dict[str, A
     with tempfile.TemporaryDirectory(prefix="roomba_v4_rooms_") as tmp:
         tmpdir = Path(tmp)
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(tmpdir)
+            _safe_extract_tar(tf, tmpdir)
         rooms_path = tmpdir / "rooms.geojson"
         if not rooms_path.exists():
             return []
@@ -96,10 +116,6 @@ def extract_room_info_from_archive(archive_path: str | Path) -> list[dict[str, A
 
 def room_names_from_info(room_info: list[dict[str, Any]]) -> list[str]:
     return [str(room.get("name")) for room in room_info if room.get("name")]
-
-
-def extract_rooms_from_archive(archive_path: str | Path) -> list[str]:
-    return room_names_from_info(extract_room_info_from_archive(archive_path))
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -732,7 +748,7 @@ def extract_map_render_metadata(
     with tempfile.TemporaryDirectory(prefix="roomba_v4_meta_") as tmp:
         tmpdir = Path(tmp)
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(tmpdir)
+            _safe_extract_tar(tf, tmpdir)
 
         rooms = (
             _load_json(tmpdir / "rooms.geojson")
@@ -833,7 +849,7 @@ def render_archive_to_png_bytes(
         tmpdir = Path(tmp)
 
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(tmpdir)
+            _safe_extract_tar(tf, tmpdir)
 
         rooms = (
             _load_json(tmpdir / "rooms.geojson")
