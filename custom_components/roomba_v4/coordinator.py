@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from math import isfinite
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +19,7 @@ from .cloud_api import CloudApiError, IRobotCloudApi
 from .const import ACTIVE_UPDATE_INTERVAL, DOCKED_UPDATE_INTERVAL, EVENT_TYPE, IDLE_UPDATE_INTERVAL, STORAGE_KEY_PREFIX, STORAGE_VERSION, UPDATE_INTERVAL
 from .debug import get_debug_dir, get_legacy_debug_dir
 from .freshness import telemetry_freshness
-from .map_renderer import extract_map_render_metadata, extract_room_info_from_archive, room_names_from_info, render_archive_to_png_bytes
+from .map_renderer import extract_map_render_metadata, extract_room_info_from_archive, geometry_polygons, room_names_from_info, render_archive_to_png_bytes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +89,9 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.rooms: list[str] = []
         self.map_render_metadata: dict[str, Any] = {}
         self.selected_room: str | None = None
+        self.map_routines: dict[str, Any] = {}
+        self.active_plan: dict[str, Any] | None = None
+        self._room_polygons_checked = False
         self.store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}.{entry_id}")
         self._restored = False
         self._restored_data: dict[str, Any] = {}
@@ -889,6 +893,9 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             base["vacuum_state"] = vacuum_state
             base.pop("_command_optimistic", None)
 
+        self._update_active_plan_progress(base.get("status", {}).get("x"), base.get("status", {}).get("y"), base.get("vacuum_state"))
+        base["active_plan"] = self.active_plan
+        base["map_routines"] = self.map_routines
         await self._maybe_emit_status_events(current_status if isinstance(current_status, dict) else {}, base.get("status") or {}, live_state)
 
         updated_livemap = base.get("live_state", {}).get("livemap") if isinstance(base.get("live_state", {}).get("livemap"), dict) else None
@@ -1066,6 +1073,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             await self._write_debug_json("map_download_state.json", map_download_state)
 
             self._apply_room_metadata(active_map, p2map_clean_score)
+            await self._ensure_room_polygons()
             await self._write_debug_json("resolved_room_info.json", self.room_info)
 
             live_state = self.api.get_live_state_snapshot()
@@ -1082,6 +1090,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             status_block = self._build_live_status_block(live_state)
             vacuum_state = self._normalize_vacuum_state_from_status(live_state, status_block)
             status_block["vacuum_state"] = vacuum_state
+            self._update_active_plan_progress(status_block.get("x"), status_block.get("y"), vacuum_state)
             await self._write_debug_json("live_state_snapshot.json", live_state)
             await self._write_debug_json("live_status_block.json", status_block)
 
@@ -1121,6 +1130,8 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
                 "room_info": self.room_info,
             "map_render_metadata": self.map_render_metadata,
                 "selected_room": self.selected_room,
+                "map_routines": self.map_routines,
+                "active_plan": self.active_plan,
                 "preferred_cleaning_mode": self.preferred_cleaning_mode(),
                 "preferred_suction_level": self.preferred_suction_level(),
                 "preferred_water_level": self.preferred_water_level(),
@@ -1157,6 +1168,8 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.rooms = room_names_from_info(self.room_info) or list(self._restored_data.get("rooms") or [])
         self.map_render_metadata = dict(self._restored_data.get("map_render_metadata") or {})
         self.selected_room = self._restored_data.get("selected_room")
+        self.map_routines = dict(self._restored_data.get("map_routines") or {})
+        self.active_plan = self._restored_data.get("active_plan") if isinstance(self._restored_data.get("active_plan"), dict) else None
         if self.supports_mopping() and not self._restored_data.get("preferred_cleaning_mode"):
             self._restored_data["preferred_cleaning_mode"] = self.derived_cleaning_mode()
         stored_url = self._restored_data.get("s3_map_url")
@@ -1531,6 +1544,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         await self.hass.async_add_executor_job(self._write_binary_file, archive, content)
         self.map_png_bytes = await self.hass.async_add_executor_job(render_archive_to_png_bytes, archive, True, True)
         self.room_info = await self.hass.async_add_executor_job(extract_room_info_from_archive, archive)
+        self._room_polygons_checked = False
         self.rooms = room_names_from_info(self.room_info)
         await self._refresh_render_metadata(archive)
         if self.rooms and self.selected_room not in self.rooms:
@@ -1544,6 +1558,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         await self.hass.async_add_executor_job(self._write_binary_file, archive, content)
         self.map_png_bytes = await self.hass.async_add_executor_job(render_archive_to_png_bytes, archive, True, True)
         self.room_info = await self.hass.async_add_executor_job(extract_room_info_from_archive, archive)
+        self._room_polygons_checked = False
         self.rooms = room_names_from_info(self.room_info)
         await self._refresh_render_metadata(archive)
         if self.rooms and self.selected_room not in self.rooms:
@@ -1594,6 +1609,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.map_archive_path = str(archive)
         self.map_png_bytes = await self.hass.async_add_executor_job(render_archive_to_png_bytes, archive, show_labels, show_coverage)
         self.room_info = await self.hass.async_add_executor_job(extract_room_info_from_archive, archive)
+        self._room_polygons_checked = False
         self.rooms = room_names_from_info(self.room_info)
         await self._refresh_render_metadata(archive)
         if self.rooms and self.selected_room not in self.rooms:
@@ -1743,16 +1759,335 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
                 return room
         return None
 
-    async def async_clean_rooms_by_selection_ids(self, selection_ids: list[Any]) -> dict[str, Any]:
-        normalized_ids: list[str] = []
-        for value in selection_ids:
+    def _room_name(self, room: dict[str, Any]) -> str:
+        props = room.get("properties") or {}
+        return str(props.get("name") or room.get("name") or room.get("id") or "")
+
+    def _room_control_id(self, room: dict[str, Any], index: int | None = None) -> str:
+        props = room.get("properties") or {}
+        value = (
+            room.get("control_room_id")
+            or props.get("control_room_id")
+            or props.get("room_id")
+            or room.get("room_id")
+            or room.get("id")
+            or index
+            or 0
+        )
+        return str(value)
+
+    def _room_index(self, room: dict[str, Any]) -> int:
+        try:
+            return self.room_info.index(room) + 1
+        except ValueError:
+            return 0
+
+    def _room_polygon_rings(self, room: dict[str, Any]) -> list[list[list[float]]]:
+        rings = room.get("polygons")
+        if not isinstance(rings, list) or not rings:
+            props = room.get("properties") or {}
+            for candidate in (room.get("geometry"), props.get("simplifiedGeometry"), props.get("geometry")):
+                if isinstance(candidate, dict):
+                    rings = geometry_polygons(candidate)
+                    if rings:
+                        break
+        if not isinstance(rings, list) or not rings:
+            props = room.get("properties") or {}
+            for source in (room, props):
+                if not isinstance(source, dict):
+                    continue
+                if all(source.get(key) is not None for key in ("x0", "y0", "x1", "y1")):
+                    try:
+                        x0, y0, x1, y1 = (float(source[key]) for key in ("x0", "y0", "x1", "y1"))
+                    except (TypeError, ValueError):
+                        continue
+                    rings = [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]]
+                    break
+                bbox = source.get("bbox") or source.get("bounds")
+                if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                    try:
+                        x0, y0, x1, y1 = (float(bbox[idx]) for idx in range(4))
+                    except (TypeError, ValueError):
+                        continue
+                    rings = [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]]
+                    break
+        out: list[list[list[float]]] = []
+        for ring in rings or []:
+            if not isinstance(ring, list):
+                continue
+            points: list[list[float]] = []
+            for point in ring:
+                if (
+                    isinstance(point, (list, tuple))
+                    and len(point) >= 2
+                    and isinstance(point[0], (int, float))
+                    and isinstance(point[1], (int, float))
+                ):
+                    points.append([float(point[0]), float(point[1])])
+            if len(points) >= 3:
+                out.append(points)
+        return out
+
+    @staticmethod
+    def _point_in_ring(x: float, y: float, ring: list[list[float]]) -> bool:
+        inside = False
+        if not ring:
+            return False
+        j = len(ring) - 1
+        for i, point in enumerate(ring):
+            xi, yi = point[0], point[1]
+            xj, yj = ring[j][0], ring[j][1]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def _room_at_point(self, x: float, y: float) -> dict[str, Any] | None:
+        for room in self.room_info:
+            for ring in self._room_polygon_rings(room):
+                if self._point_in_ring(x, y, ring):
+                    return room
+        return None
+
+    @staticmethod
+    def _ring_area(ring: list[list[float]]) -> float:
+        area = 0.0
+        if len(ring) < 3:
+            return 0.0
+        j = len(ring) - 1
+        for i, point in enumerate(ring):
+            area += (ring[j][0] * point[1]) - (point[0] * ring[j][1])
+            j = i
+        return abs(area) / 2.0
+
+    def room_geometry_payload(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for index, room in enumerate(self.room_info, start=1):
+            rings = self._room_polygon_rings(room)
+            if not rings:
+                continue
+            largest = max(rings, key=len)
+            center = [
+                sum(point[0] for point in largest) / len(largest),
+                sum(point[1] for point in largest) / len(largest),
+            ]
+            out.append({
+                "id": self._room_control_id(room, index),
+                "name": self._room_name(room),
+                "index": index,
+                "polygons": rings,
+                "center": center,
+                "area": sum(self._ring_area(ring) for ring in rings),
+            })
+        return out
+
+    async def _ensure_room_polygons(self) -> bool:
+        if not self.room_info:
+            return False
+        if all(isinstance(room.get("polygons"), list) and room.get("polygons") for room in self.room_info):
+            return False
+        if self._room_polygons_checked:
+            return False
+        self._room_polygons_checked = True
+        archive = Path(self.map_archive_path)
+        if not archive.exists():
+            return False
+        try:
+            extra = await self.hass.async_add_executor_job(extract_room_info_from_archive, archive)
+        except Exception as err:
+            _LOGGER.debug("roomba_v4: unable to load room polygons from archive: %s", err)
+            return False
+        by_id = {str(item.get("id")): item for item in extra if isinstance(item, dict)}
+        by_name = {
+            str(item.get("name") or "").casefold(): item
+            for item in extra
+            if isinstance(item, dict) and item.get("name")
+        }
+        changed = False
+        for room in self.room_info:
+            if isinstance(room.get("polygons"), list) and room.get("polygons"):
+                continue
+            match = by_id.get(str(room.get("id"))) or by_id.get(str(room.get("room_id")))
+            if match is None:
+                match = by_name.get(self._room_name(room).casefold())
+            if match and isinstance(match.get("polygons"), list) and match.get("polygons"):
+                room["polygons"] = match["polygons"]
+                if isinstance(match.get("geometry"), dict):
+                    room["geometry"] = match["geometry"]
+                changed = True
+        return changed
+
+    def _sync_local_map_state(self) -> dict[str, Any]:
+        base = dict(self.data or self._restored_data or {})
+        base["map_routines"] = self.map_routines
+        base["active_plan"] = self.active_plan
+        self._restored_data = dict(base)
+        if isinstance(self.data, dict):
+            self.data["map_routines"] = self.map_routines
+            self.data["active_plan"] = self.active_plan
+        return base
+
+    def _update_active_plan_progress(self, x: Any, y: Any, vacuum_state: str | None) -> None:
+        plan = self.active_plan
+        if not isinstance(plan, dict):
+            return
+        rooms = plan.get("rooms")
+        if not isinstance(rooms, list):
+            return
+        room_ids = [str(item.get("id")) for item in rooms if isinstance(item, dict) and item.get("id") is not None]
+        if not room_ids:
+            return
+        completed = [str(value) for value in (plan.get("completed_room_ids") or []) if value is not None]
+        current = str(plan.get("current_room_id")) if plan.get("current_room_id") is not None else None
+        state = str(vacuum_state or "").lower()
+        if state in {"idle", "docked", "charging"} and plan.get("status") == "starting":
+            started_at = plan.get("started_at")
+            if isinstance(started_at, str):
+                try:
+                    started = datetime.fromisoformat(started_at)
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=UTC)
+                    if (datetime.now(tz=UTC) - started).total_seconds() < 90:
+                        return
+                except (TypeError, ValueError):
+                    pass
+        matched_room: dict[str, Any] | None = None
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            matched_room = self._room_at_point(float(x), float(y))
+        if matched_room is not None:
+            if state in {"idle", "docked", "charging"}:
+                self._finish_active_plan()
+                return
+            room_id = self._room_control_id(matched_room, self._room_index(matched_room))
+            if room_id in room_ids:
+                if current and current != room_id and current in room_ids and current not in completed:
+                    completed.append(current)
+                if current != room_id:
+                    plan["current_room_id"] = room_id
+                    plan["current_room_name"] = self._room_name(matched_room)
+                    current = room_id
+                plan["status"] = "paused" if state == "paused" else ("returning" if state == "returning" else "cleaning")
+        elif state in {"returning", "docked", "charging", "idle"}:
+            if current and current in room_ids and current not in completed:
+                completed.append(current)
+            plan["current_room_id"] = None
+            plan["current_room_name"] = None
+            current = None
+            if state in {"docked", "charging", "idle"}:
+                plan["status"] = "finished"
+            else:
+                plan["status"] = "returning"
+        plan["completed_room_ids"] = completed
+        plan["remaining_room_ids"] = [room_id for room_id in room_ids if room_id not in completed and room_id != current]
+        if len(plan["completed_room_ids"]) >= len(room_ids) and state in {"docked", "charging", "idle"}:
+            plan["status"] = "finished"
+
+    def _finish_active_plan(self) -> None:
+        plan = self.active_plan
+        if not isinstance(plan, dict):
+            return
+        rooms = plan.get("rooms") if isinstance(plan.get("rooms"), list) else []
+        room_ids = [str(item.get("id")) for item in rooms if isinstance(item, dict) and item.get("id") is not None]
+        completed = [str(value) for value in (plan.get("completed_room_ids") or []) if value is not None]
+        current = plan.get("current_room_id")
+        if current and str(current) in room_ids and str(current) not in completed:
+            completed.append(str(current))
+        plan["completed_room_ids"] = completed
+        plan["current_room_id"] = None
+        plan["current_room_name"] = None
+        plan["remaining_room_ids"] = [room_id for room_id in room_ids if room_id not in completed]
+        plan["status"] = "finished"
+
+    def _resolve_room_by_selection(self, selection: Any) -> dict[str, Any] | None:
+        value = str(selection or "").strip()
+        if not value:
+            return None
+        room = self._resolve_room_entry_by_selection_id(value)
+        if room is not None:
+            return room
+        folded = value.casefold()
+        for candidate in self.room_info:
+            if self._room_name(candidate).casefold() == folded:
+                return candidate
+        return None
+
+    def _normalize_operating_mode_value(self, value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = int(value)
+            return number if number in {1, 2, 3, 6} else None
+        text = str(value or "").strip().lower()
+        if text.isdigit():
+            number = int(text)
+            return number if number in {1, 2, 3, 6} else None
+        if text in {"mop", "mopping", "wet"}:
+            return 1
+        if text in {"vacuum", "vacuuming", "dry"}:
+            return 2
+        if ("mop" in text or "wet" in text) and ("vac" in text or "both" in text or "combo" in text):
+            return 6 if self.supports_mopping() else 2
+        return None
+
+    def _profile_override_params(self, overrides: Any) -> dict[str, Any]:
+        if not isinstance(overrides, dict):
+            return {}
+        out: dict[str, Any] = {}
+        if overrides.get("twoPass") is not None:
+            out["twoPass"] = bool(overrides.get("twoPass"))
+        if overrides.get("passes") is not None:
+            try:
+                out["twoPass"] = int(overrides.get("passes")) >= 2
+            except (TypeError, ValueError):
+                pass
+        mode = self._normalize_operating_mode_value(
+            overrides.get("operatingMode", overrides.get("operating_mode", overrides.get("mode", overrides.get("cleaning_mode"))))
+        )
+        if mode is not None:
+            out["operatingMode"] = mode
+        for key in ("suctionLevel", "suction_level", "suction"):
+            if overrides.get(key) is not None:
+                suction = self._normalize_suction_level_value(str(overrides.get(key)))
+                if suction is not None:
+                    out["suctionLevel"] = suction
+                break
+        for key in ("waterLevel", "water_level", "water", "padWetness", "pad_plate"):
+            value = overrides.get(key)
             if value is None:
                 continue
-            sval = str(value).strip()
-            if sval and sval not in normalized_ids:
-                normalized_ids.append(sval)
-        if not normalized_ids:
-            raise CloudApiError("No room ids supplied")
+            if isinstance(value, dict):
+                value = value.get("padPlate")
+            water = self._normalize_water_level_value(str(value)) if value is not None else None
+            if water is not None:
+                out["_padPlate"] = water
+            break
+        return out
+
+    async def _save_local_map_state(self) -> None:
+        base = self._sync_local_map_state()
+        await self.store.async_save(base)
+
+    async def async_clean_rooms(self, rooms: list[Any], settings: dict[str, Any] | None = None, *, source: str = "clean_rooms") -> dict[str, Any]:
+        requested: list[dict[str, Any]] = []
+        for item in rooms or []:
+            if isinstance(item, str):
+                selector, profiles = item, {}
+            elif isinstance(item, dict):
+                selector = item.get("room") or item.get("room_id") or item.get("id") or item.get("name")
+                profiles = item.get("settings") or item.get("params") or {}
+                if not profiles:
+                    profiles = {
+                        key: item.get(key)
+                        for key in ("passes", "twoPass", "suctionLevel", "suction", "waterLevel", "water", "mode", "operatingMode", "padWetness")
+                        if item.get(key) is not None
+                    }
+            else:
+                continue
+            value = str(selector or "").strip()
+            if value:
+                requested.append({"selector": value, "profiles": profiles if isinstance(profiles, dict) else {}})
+        if not requested:
+            raise CloudApiError("No rooms supplied")
 
         robot_state = self.data.get("robot") if isinstance(self.data, dict) else None
         p2map_id = (self.data.get("active_map_id") if isinstance(self.data, dict) else None) or ((robot_state or {}).get("p2map_id") if isinstance(robot_state, dict) else None)
@@ -1760,31 +2095,41 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
 
         regions: list[dict[str, Any]] = []
         resolved: list[dict[str, Any]] = []
-        for selection_id in normalized_ids:
-            room = self._resolve_room_entry_by_selection_id(selection_id)
+        plan_rooms: list[dict[str, Any]] = []
+        seen_region_ids: set[str] = set()
+        global_settings = settings if isinstance(settings, dict) else {}
+        for entry in requested:
+            room = self._resolve_room_by_selection(entry["selector"])
             if not room:
-                resolved.append({"selection_id": selection_id, "matched": False})
+                resolved.append({"selection_id": entry["selector"], "matched": False})
                 continue
             region_candidates = self._room_region_candidates(room)
             if not region_candidates:
-                resolved.append({"selection_id": selection_id, "matched": True, "room_name": room.get("name"), "region_candidates": []})
+                resolved.append({"selection_id": entry["selector"], "matched": True, "room_name": self._room_name(room), "region_candidates": []})
                 continue
             region_id = str(region_candidates[0])
-            region_params = self._build_region_cleaning_params(region_id)
-            region = {"region_id": region_id, "type": "rid", "params": region_params}
-            regions.append(region)
+            overrides = {**global_settings, **(entry.get("profiles") or {})}
+            region_params = self._build_region_cleaning_params(region_id, overrides=overrides)
+            room_id = self._room_control_id(room, self._room_index(room))
             resolved.append({
-                "selection_id": selection_id,
+                "selection_id": entry["selector"],
                 "matched": True,
-                "room_name": str((room.get("properties") or {}).get("name") or room.get("name") or ""),
+                "room_name": self._room_name(room),
+                "room_id": room_id,
                 "region_candidates": region_candidates,
                 "resolved_region_id": region_id,
+                "overrides": overrides,
             })
+            if region_id in seen_region_ids:
+                continue
+            seen_region_ids.add(region_id)
+            regions.append({"region_id": region_id, "type": "rid", "params": region_params})
+            plan_rooms.append({"id": room_id, "name": self._room_name(room), "region_id": region_id, "params": region_params})
 
         if any(not item.get("matched") or not item.get("region_candidates") for item in resolved):
-            raise CloudApiError(f"Unable to resolve every requested room: {normalized_ids}")
+            raise CloudApiError(f"Unable to resolve every requested room: {[item.get('selection_id') for item in resolved if not item.get('matched') or not item.get('region_candidates')]}")
         if not regions:
-            raise CloudApiError(f"No cleanable rooms resolved from ids: {normalized_ids}")
+            raise CloudApiError("No cleanable rooms resolved from the requested selection")
 
         commanddef: dict[str, Any] = {
             "robot_id": self.robot_blid,
@@ -1800,14 +2145,116 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             commanddef["user_p2mapv_id"] = pmapv_id
 
         await self._write_debug_json("send_command_app_segment_clean_context.json", {
-            "selection_ids": normalized_ids,
+            "source": source,
+            "selection_ids": [entry["selector"] for entry in requested],
+            "settings": global_settings,
             "resolved": resolved,
             "commanddef": commanddef,
         })
-        result = await self.api.publish_commanddef_via_cloud_mqtt(commanddef)
+        plan = {
+            "id": uuid.uuid4().hex,
+            "started_at": datetime.now(tz=UTC).isoformat(),
+            "source": source,
+            "status": "starting",
+            "rooms": plan_rooms,
+            "current_room_id": None,
+            "current_room_name": None,
+            "completed_room_ids": [],
+            "remaining_room_ids": [room["id"] for room in plan_rooms],
+            "settings": global_settings,
+        }
+        try:
+            result = await self.api.publish_commanddef_via_cloud_mqtt(commanddef)
+        except Exception:
+            self.active_plan = None
+            raise
         await self._write_debug_json("send_command_app_segment_clean_result.json", result)
+        self.active_plan = plan
+        await self._save_local_map_state()
         self.async_update_listeners()
         return result
+
+    async def async_clean_rooms_by_selection_ids(self, selection_ids: list[Any]) -> dict[str, Any]:
+        return await self.async_clean_rooms(list(selection_ids or []), source="selection_ids")
+
+    async def async_save_map_routine(self, name: str, config: dict[str, Any]) -> None:
+        routine_name = str(name or "").strip()
+        if not routine_name:
+            raise CloudApiError("Routine name must not be empty")
+        if not isinstance(config, dict):
+            raise CloudApiError("Routine config must be an object")
+        self.map_routines = {
+            **self.map_routines,
+            routine_name: {"config": config, "updated_at": datetime.now(tz=UTC).isoformat()},
+        }
+        await self._save_local_map_state()
+        self.async_update_listeners()
+
+    async def async_delete_map_routine(self, name: str) -> None:
+        routine_name = str(name or "").strip()
+        if routine_name not in self.map_routines:
+            raise CloudApiError(f"Unknown map routine: {routine_name}")
+        self.map_routines = {key: value for key, value in self.map_routines.items() if key != routine_name}
+        await self._save_local_map_state()
+        self.async_update_listeners()
+
+    async def async_run_map_routine(self, name: str) -> dict[str, Any]:
+        routine_name = str(name or "").strip()
+        routine = self.map_routines.get(routine_name)
+        config = routine.get("config") if isinstance(routine, dict) else None
+        if not isinstance(config, dict):
+            raise CloudApiError(f"Unknown map routine: {routine_name}")
+        mode = str(config.get("mode") or "select").lower()
+        selected: list[str] = []
+        for value in config.get("rooms") or []:
+            if value is None:
+                continue
+            room = self._resolve_room_by_selection(value)
+            selected.append(self._room_control_id(room, self._room_index(room)) if room is not None else str(value))
+        profiles = config.get("profiles") if isinstance(config.get("profiles"), dict) else {}
+        all_rooms = [
+            (self._room_control_id(room, index), self._room_name(room), room)
+            for index, room in enumerate(self.room_info, start=1)
+        ]
+        if mode == "all":
+            wanted = [room_id for room_id, _name, _room in all_rooms]
+        elif mode == "exclude":
+            excluded = set(selected)
+            wanted = [room_id for room_id, _name, _room in all_rooms if room_id not in excluded]
+        else:
+            wanted = selected
+        items: list[dict[str, Any]] = []
+        for room_id, room_name, room in all_rooms:
+            if room_id not in wanted:
+                continue
+            profile = profiles.get(room_id) or profiles.get(room_name) or profiles.get(str(self._room_index(room))) or {}
+            items.append({"room": room_id, "settings": profile if isinstance(profile, dict) else {}})
+        for room_id in wanted:
+            if not any(str(item.get("room")) == room_id for item in items):
+                items.append({"room": room_id, "settings": profiles.get(room_id) or {}})
+        if not items:
+            raise CloudApiError(f"Routine {routine_name} resolves to no rooms")
+        return await self.async_clean_rooms(items, settings=config.get("settings"), source=f"routine:{routine_name}")
+
+    async def async_skip_room(self) -> dict[str, Any]:
+        result = await self.api.async_send_simple_command(self.robot_blid, "skip")
+        plan = self.active_plan
+        if isinstance(plan, dict):
+            current = plan.get("current_room_id")
+            if current:
+                completed = [str(value) for value in (plan.get("completed_room_ids") or []) if value is not None]
+                if str(current) not in completed:
+                    completed.append(str(current))
+                plan["completed_room_ids"] = completed
+                plan["current_room_id"] = None
+                plan["current_room_name"] = None
+                rooms = plan.get("rooms") if isinstance(plan.get("rooms"), list) else []
+                room_ids = [str(item.get("id")) for item in rooms if isinstance(item, dict) and item.get("id") is not None]
+                plan["remaining_room_ids"] = [room_id for room_id in room_ids if room_id not in completed]
+            await self._save_local_map_state()
+        self.async_update_listeners()
+        return result
+
 
     async def async_clear_trails(self) -> None:
         base = dict(self.data or self._restored_data or {})
@@ -1835,10 +2282,13 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         self.async_update_listeners()
 
     async def async_clean_room_by_name(self, room_name: str) -> dict[str, Any]:
-        if room_name not in self.rooms:
+        room = self._resolve_room_by_selection(room_name)
+        if room is None:
             raise CloudApiError(f"Unknown room selection: {room_name}")
-        await self.async_select_room(room_name)
-        return await self.async_clean_selected_room()
+        resolved_name = self._room_name(room)
+        if resolved_name in self.rooms:
+            await self.async_select_room(resolved_name)
+        return await self.async_clean_rooms([room_name], source="clean_room")
 
     def _normalize_suction_level_value(self, option: str | None, fallback: int | None = None) -> int | None:
         text = str(option or "").strip()
@@ -1910,7 +2360,7 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
                     return json.loads(json.dumps(prefs))
         return {}
 
-    def _build_region_cleaning_params(self, region_id: str | None = None) -> dict[str, Any]:
+    def _build_region_cleaning_params(self, region_id: str | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         params = self._default_region_params_from_clean_score(region_id)
         if "twoPass" not in params:
             params["twoPass"] = False
@@ -1934,6 +2384,16 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
             params["padWetness"] = {"padPlate": water_level}
         elif operating_mode == 2:
             params.pop("padWetness", None)
+
+        override_params = self._profile_override_params(overrides)
+        if override_params:
+            pad_plate = override_params.pop("_padPlate", None)
+            params.update(override_params)
+            mode = params.get("operatingMode")
+            if pad_plate is not None and self.supports_mopping() and mode in {1, 3, 6}:
+                params["padWetness"] = {"padPlate": pad_plate}
+            elif mode == 2:
+                params.pop("padWetness", None)
 
         return params
 
@@ -2191,6 +2651,8 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
 
     async def async_stop_cleaning(self) -> dict[str, Any]:
         result = await self.api.async_send_simple_command(self.robot_blid, "stop")
+        self._finish_active_plan()
+        await self._save_local_map_state()
         await self._apply_optimistic_state("idle", "stop", "Roomba is idle", command_name="stop", preserve_seconds=5)
         return result
 

@@ -12,6 +12,45 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 
+def _ring_to_points(ring: Any) -> list[list[float]]:
+    points: list[list[float]] = []
+    if not isinstance(ring, (list, tuple)):
+        return points
+    for coord in ring:
+        if (
+            isinstance(coord, (list, tuple))
+            and len(coord) >= 2
+            and isinstance(coord[0], (int, float))
+            and isinstance(coord[1], (int, float))
+        ):
+            points.append([float(coord[0]), float(coord[1])])
+    return points
+
+
+def geometry_polygons(geom: dict[str, Any] | None) -> list[list[list[float]]]:
+    """Return the outer rings of a GeoJSON geometry in map meters."""
+    if not isinstance(geom, dict):
+        return []
+    geom_type = geom.get("type")
+    coords = geom.get("coordinates")
+    polygons: list[list[list[float]]] = []
+    if geom_type == "Polygon" and isinstance(coords, list) and coords:
+        ring = _ring_to_points(coords[0])
+        if len(ring) >= 3:
+            polygons.append(ring)
+    elif geom_type == "MultiPolygon" and isinstance(coords, list):
+        for polygon in coords:
+            if not isinstance(polygon, list) or not polygon:
+                continue
+            ring = _ring_to_points(polygon[0])
+            if len(ring) >= 3:
+                polygons.append(ring)
+    elif geom_type == "GeometryCollection":
+        for child in geom.get("geometries") or []:
+            polygons.extend(geometry_polygons(child if isinstance(child, dict) else None))
+    return polygons
+
+
 def extract_room_info_from_archive(archive_path: str | Path) -> list[dict[str, Any]]:
     archive = Path(archive_path)
     with tempfile.TemporaryDirectory(prefix="roomba_v4_rooms_") as tmp:
@@ -39,12 +78,17 @@ def extract_room_info_from_archive(archive_path: str | Path) -> list[dict[str, A
                 or props.get("segment_id")
                 or str(idx)
             )
+            simplified = props.get("simplifiedGeometry")
+            geometry = simplified if isinstance(simplified, dict) and simplified.get("coordinates") else feat.get("geometry")
+            polygons = geometry_polygons(geometry if isinstance(geometry, dict) else None)
             out.append(
                 {
                     "name": str(label),
                     "id": str(room_id),
                     "properties": props,
-                    "geometry_type": (feat.get("geometry") or {}).get("type"),
+                    "geometry_type": (geometry or {}).get("type"),
+                    "geometry": geometry,
+                    "polygons": polygons,
                 }
             )
         return out

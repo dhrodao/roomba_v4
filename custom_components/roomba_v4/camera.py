@@ -928,6 +928,7 @@ class RoombaV4MapCamera(RoombaV4Entity, Camera):
         scaled_calibration_points = _scale_calibration_points(meta.get("calibration_points") or [])
         attrs = {
             "map_png_ready": self.coordinator.map_png_bytes is not None,
+            "entry_id": self.coordinator.entry_id,
             "last_map_refresh": self.coordinator.last_map_refresh,
             "active_map_id": data.get("active_map_id"),
             "active_map_version": data.get("active_map_version"),
@@ -935,6 +936,21 @@ class RoombaV4MapCamera(RoombaV4Entity, Camera):
             "auto_download_map": self.coordinator.auto_download_map,
             "s3_map_url_known": data.get("s3_map_url_known"),
             "rooms": xiaomi_rooms,
+            "room_geometry": self.coordinator.room_geometry_payload(),
+            "room_order": [
+                self.coordinator._room_control_id(room, index)
+                for index, room in enumerate(self.coordinator.room_info or [], start=1)
+            ],
+            "map_routines": self.coordinator.map_routines,
+            "cleaning_profiles": {
+                "suction_levels": self.coordinator.suction_level_options(),
+                "water_levels": self.coordinator.water_level_options(),
+                "cleaning_modes": self.coordinator.cleaning_mode_options(),
+                "supports_mopping": self.coordinator.supports_mopping(),
+                "preferred_cleaning_mode": self.coordinator.preferred_cleaning_mode(),
+                "preferred_suction_level": self.coordinator.preferred_suction_level(),
+                "preferred_water_level": self.coordinator.preferred_water_level(),
+            },
             "selected_room": self.coordinator.selected_room,
             "debug_dir": data.get("debug_dir"),
             "umf_fetched": data.get("umf_fetched"),
@@ -983,4 +999,31 @@ class RoombaV4MapCamera(RoombaV4Entity, Camera):
         attrs["recent_pose_candidates_count"] = len(self._recent_pose_candidates)
         if card_path and card_path.get("path"):
             attrs["path"] = card_path
+        active_plan = self.coordinator.active_plan if isinstance(self.coordinator.active_plan, dict) else None
+        if active_plan:
+            plan_rooms = active_plan.get("rooms") if isinstance(active_plan.get("rooms"), list) else []
+            completed = active_plan.get("completed_room_ids") or []
+            attrs["active_plan"] = active_plan
+            attrs["mission_rooms"] = plan_rooms
+            attrs["mission_status"] = active_plan.get("status")
+            attrs["mission_source"] = active_plan.get("source")
+            attrs["current_room_id"] = active_plan.get("current_room_id")
+            attrs["current_room_name"] = active_plan.get("current_room_name")
+            attrs["completed_room_ids"] = completed
+            attrs["remaining_room_ids"] = active_plan.get("remaining_room_ids") or []
+            attrs["mission_progress"] = {
+                "total": len(plan_rooms),
+                "completed": len(completed),
+                "remaining": len(active_plan.get("remaining_room_ids") or []),
+            }
+        else:
+            attrs["active_plan"] = None
+            attrs["mission_rooms"] = []
+            attrs["mission_status"] = None
+            attrs["mission_source"] = None
+            attrs["current_room_id"] = None
+            attrs["current_room_name"] = None
+            attrs["completed_room_ids"] = []
+            attrs["remaining_room_ids"] = []
+            attrs["mission_progress"] = {"total": 0, "completed": 0, "remaining": 0}
         return attrs

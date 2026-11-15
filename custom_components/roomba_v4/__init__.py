@@ -1,9 +1,16 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
+from pathlib import Path
 
 import voluptuous as vol
+from homeassistant.components.frontend import add_extra_js_url
+try:
+    from homeassistant.components.http import StaticPathConfig
+except ImportError:  # Home Assistant < 2024.7
+    StaticPathConfig = None  # type: ignore[assignment]
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -16,11 +23,56 @@ from .debug import get_debug_enabled
 
 type RoombaV4ConfigEntry = ConfigEntry[dict]
 
+_LOGGER = logging.getLogger(__name__)
+
 SERVICE_REFRESH_MAP_FROM_ARCHIVE = "refresh_map_from_archive"
 SERVICE_REFRESH_MAP_FROM_URL = "refresh_map_from_url"
 SERVICE_CLEAR_PATH_HISTORY = "clear_path_history"
 SERVICE_CLEAN_ROOM = "clean_room"
 SERVICE_SPOT_CLEAN = "spot_clean"
+SERVICE_CLEAN_ROOMS = "clean_rooms"
+SERVICE_SAVE_ROUTINE = "save_routine"
+SERVICE_DELETE_ROUTINE = "delete_routine"
+SERVICE_RUN_ROUTINE = "run_routine"
+SERVICE_SKIP_ROOM = "skip_room"
+SERVICE_MISSION_COMMAND = "mission_command"
+
+CARD_URL = "/roomba_v4/roomba-v4-map-card.js"
+FRONTEND_REGISTERED = f"{DOMAIN}_frontend_registered"
+
+
+async def _async_register_frontend(hass: HomeAssistant) -> None:
+    if hass.data.get(FRONTEND_REGISTERED):
+        return
+    hass.data[FRONTEND_REGISTERED] = True
+    card_dir = Path(__file__).parent / "frontend"
+    try:
+        if StaticPathConfig is not None and hasattr(hass.http, "async_register_static_paths"):
+            await hass.http.async_register_static_paths([
+                StaticPathConfig("/roomba_v4", str(card_dir), cache_headers=False)
+            ])
+        else:
+            hass.http.register_static_path("/roomba_v4", str(card_dir), cache_headers=False)
+    except Exception as err:
+        _LOGGER.warning("roomba_v4: unable to register map card static path: %s", err)
+    try:
+        add_extra_js_url(hass, CARD_URL)
+    except Exception as err:
+        _LOGGER.warning("roomba_v4: unable to register map card frontend module: %s", err)
+
+
+def _target_coordinator(hass: HomeAssistant, call: ServiceCall) -> RoombaV4Coordinator:
+    entry_id = call.data.get("entry_id")
+    coordinators = hass.data.get(DOMAIN) or {}
+    if entry_id:
+        coordinator = coordinators.get(entry_id)
+        if coordinator is None:
+            raise vol.Invalid(f"Unknown roomba_v4 entry_id: {entry_id}")
+        return coordinator
+    if len(coordinators) == 1:
+        return next(iter(coordinators.values()))
+    raise vol.Invalid("Specify entry_id to select which robot should handle this service")
+
 
 async def _async_reload_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
@@ -155,6 +207,115 @@ async def async_setup_entry(hass: HomeAssistant, entry: RoombaV4ConfigEntry) -> 
             _handle_clear_path_history,
         )
 
+    if not hass.services.has_service(DOMAIN, SERVICE_CLEAN_ROOMS):
+        async def _handle_clean_rooms(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            rooms = call.data["rooms"]
+            if isinstance(rooms, (str, dict)):
+                rooms = [rooms]
+            await coordinator.async_clean_rooms(
+                list(rooms),
+                settings=call.data.get("settings"),
+                source="service",
+            )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_CLEAN_ROOMS,
+            _handle_clean_rooms,
+            schema=vol.Schema({
+                vol.Required("rooms"): vol.Any(str, dict, [vol.Any(str, dict)]),
+                vol.Optional("settings"): dict,
+                vol.Optional("entry_id"): str,
+            }),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SAVE_ROUTINE):
+        async def _handle_save_routine(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            await coordinator.async_save_map_routine(call.data["name"], call.data["config"])
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SAVE_ROUTINE,
+            _handle_save_routine,
+            schema=vol.Schema({
+                vol.Required("name"): str,
+                vol.Required("config"): dict,
+                vol.Optional("entry_id"): str,
+            }),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_DELETE_ROUTINE):
+        async def _handle_delete_routine(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            await coordinator.async_delete_map_routine(call.data["name"])
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DELETE_ROUTINE,
+            _handle_delete_routine,
+            schema=vol.Schema({
+                vol.Required("name"): str,
+                vol.Optional("entry_id"): str,
+            }),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RUN_ROUTINE):
+        async def _handle_run_routine(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            await coordinator.async_run_map_routine(call.data["name"])
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RUN_ROUTINE,
+            _handle_run_routine,
+            schema=vol.Schema({
+                vol.Required("name"): str,
+                vol.Optional("entry_id"): str,
+            }),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SKIP_ROOM):
+        async def _handle_skip_room(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            await coordinator.async_skip_room()
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SKIP_ROOM,
+            _handle_skip_room,
+            schema=vol.Schema({vol.Optional("entry_id"): str}),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_MISSION_COMMAND):
+        async def _handle_mission_command(call: ServiceCall) -> None:
+            coordinator = _target_coordinator(hass, call)
+            command = str(call.data["command"]).lower()
+            if command == "pause":
+                await coordinator.async_pause_cleaning()
+            elif command == "resume":
+                await coordinator.async_resume_cleaning()
+            elif command == "stop":
+                await coordinator.async_stop_cleaning()
+            elif command == "dock":
+                await coordinator.async_return_to_base()
+            elif command == "skip":
+                await coordinator.async_skip_room()
+            else:
+                raise vol.Invalid(f"Unsupported mission command: {command}")
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_MISSION_COMMAND,
+            _handle_mission_command,
+            schema=vol.Schema({
+                vol.Required("command"): vol.In(["pause", "resume", "stop", "dock", "skip"]),
+                vol.Optional("entry_id"): str,
+            }),
+        )
+
+    await _async_register_frontend(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 

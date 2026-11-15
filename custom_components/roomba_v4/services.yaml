@@ -66,3 +66,97 @@ clean_room:
       required: false
       selector:
         text:
+
+clean_rooms:
+  name: Clean rooms
+  description: >-
+    Start cleaning an ordered list of mapped rooms. Each item can be a room name,
+    a room id, or an object with the room plus per-room settings such as passes,
+    suctionLevel, waterLevel and mode.
+  fields:
+    rooms:
+      name: Rooms
+      required: true
+      selector:
+        object:
+    settings:
+      name: Global settings
+      description: Default settings applied to every selected room.
+      required: false
+      selector:
+        object:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+save_routine:
+  name: Save map routine
+  description: Save a local map-card routine (room selection, exclusions and per-room settings).
+  fields:
+    name:
+      required: true
+      selector:
+        text:
+    config:
+      required: true
+      selector:
+        object:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+delete_routine:
+  name: Delete map routine
+  description: Delete a locally stored map routine.
+  fields:
+    name:
+      required: true
+      selector:
+        text:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+run_routine:
+  name: Run map routine
+  description: Start cleaning using a previously saved local map routine.
+  fields:
+    name:
+      required: true
+      selector:
+        text:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+skip_room:
+  name: Skip current room
+  description: Ask the robot to skip the room it is currently cleaning.
+  fields:
+    entry_id:
+      required: false
+      selector:
+        text:
+
+mission_command:
+  name: Mission command
+  description: Pause, resume, stop, dock or skip the current cleaning mission.
+  fields:
+    command:
+      required: true
+      selector:
+        select:
+          options:
+            - pause
+            - resume
+            - stop
+            - dock
+            - skip
+    entry_id:
+      required: false
+      selector:
+        text:
