@@ -81,14 +81,14 @@ const STYLE = `
   .chip.excluded { border-color: #e53935; color: var(--error-color); text-decoration: line-through; }
   .chip.current { border-color: #ff9800; box-shadow: inset 0 0 0 1px #ff9800; }
   .chip.completed { border-color: #43a047; }
-  .profile {
+  .settings {
     border: 1px solid var(--divider-color); border-radius: 10px;
     padding: 9px 10px; display: flex; flex-direction: column; gap: 8px;
   }
-  .profile-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; }
-  .profile-head .name { flex: 1; }
-  .profile-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; }
-  .profile-row label { display: inline-flex; align-items: center; gap: 5px; color: var(--secondary-text-color); }
+  .settings-head { font-size: 13px; font-weight: 500; }
+  .settings-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; }
+  .settings-row label { display: inline-flex; align-items: center; gap: 5px; color: var(--secondary-text-color); }
+  .settings-row select:disabled { opacity: .45; }
   .progress { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--secondary-text-color); }
   .bar { height: 7px; border-radius: 999px; background: var(--divider-color); overflow: hidden; }
   .bar > div { height: 100%; background: var(--primary-color); width: 0; transition: width .3s; }
@@ -105,8 +105,7 @@ class RoombaV4MapCard extends HTMLElement {
     this._hass = null;
     this._mode = "select";
     this._selected = new Set();
-    this._profiles = {};
-    this._focusedRoomId = null;
+    this._settings = {};
     this._selectedRoutine = "";
     this._busy = false;
     this._notice = "";
@@ -188,7 +187,7 @@ class RoombaV4MapCard extends HTMLElement {
           <button data-action="mode" data-mode="exclude">Excluir</button>
         </div>
         <div class="rooms"></div>
-        <div class="profile"></div>
+        <div class="settings"></div>
         <div class="routine-row">
           <select data-role="routine"></select>
           <button data-action="routine-apply">Aplicar</button>
@@ -211,7 +210,7 @@ class RoombaV4MapCard extends HTMLElement {
       empty: card.querySelector(".empty"),
       modebar: card.querySelector(".modebar"),
       rooms: card.querySelector(".rooms"),
-      profile: card.querySelector(".profile"),
+      settings: card.querySelector(".settings"),
       routineSelect: card.querySelector('[data-role="routine"]'),
       routineRow: card.querySelector(".routine-row"),
       actions: card.querySelector(".actions"),
@@ -239,7 +238,12 @@ class RoombaV4MapCard extends HTMLElement {
       if (saved && typeof saved === "object") {
         if (typeof saved.mode === "string") this._mode = saved.mode;
         if (Array.isArray(saved.rooms)) this._selected = new Set(saved.rooms.map(String));
-        if (saved.profiles && typeof saved.profiles === "object") this._profiles = saved.profiles;
+        if (saved.settings && typeof saved.settings === "object") {
+          this._settings = saved.settings;
+        } else if (saved.profiles && typeof saved.profiles === "object") {
+          const legacy = Object.values(saved.profiles).find((value) => value && typeof value === "object");
+          if (legacy) this._settings = legacy;
+        }
         if (typeof saved.routine === "string") this._selectedRoutine = saved.routine;
       }
     } catch (err) {
@@ -252,7 +256,7 @@ class RoombaV4MapCard extends HTMLElement {
       localStorage.setItem(`roomba_v4_card_${this._config.entity}`, JSON.stringify({
         mode: this._mode,
         rooms: [...this._selected],
-        profiles: this._profiles,
+        settings: this._settings,
         routine: this._selectedRoutine,
       }));
     } catch (err) {
@@ -278,6 +282,7 @@ class RoombaV4MapCard extends HTMLElement {
       this._els.empty.style.display = "flex";
       this._els.img.style.display = "none";
       this._els.rooms.innerHTML = "";
+      this._els.settings.innerHTML = "";
       this._els.actions.innerHTML = "";
       this._els.progress.innerHTML = "";
       return;
@@ -291,7 +296,7 @@ class RoombaV4MapCard extends HTMLElement {
     this._updateMap(attrs, geo);
     this._updateModes();
     this._updateRoomList(attrs, geo);
-    this._updateProfile(attrs, geo);
+    this._updateSettings(attrs);
     this._updateRoutines(attrs);
     this._updateActions(attrs);
     this._updateProgress(attrs);
@@ -470,77 +475,89 @@ class RoombaV4MapCard extends HTMLElement {
     });
   }
 
-  _focusedRoom(geo) {
-    return geo.find((room) => String(room.id) === String(this._focusedRoomId)) || null;
+  _cleaningModeLabel(value) {
+    const labels = {
+      Vacuum: "Solo aspirar",
+      Mop: "Solo fregar",
+      "Vacuum + Mop": "Aspirar + fregar",
+    };
+    return labels[value] || value;
   }
 
-  _updateProfile(attrs, geo) {
-    const room = this._focusedRoom(geo);
+  _updateSettings(attrs) {
     const caps = attrs.cleaning_profiles || {};
-    if (!room || this._mode === "exclude") {
-      if (this._keys.profile !== "hidden") {
-        this._keys.profile = "hidden";
-        this._els.profile.innerHTML = "";
-      }
-      return;
+    const modes = Array.isArray(caps.cleaning_modes) && caps.cleaning_modes.length
+      ? caps.cleaning_modes
+      : ["Vacuum"];
+    const suctionLevels = Array.isArray(caps.suction_levels) ? caps.suction_levels : [];
+    const waterLevels = Array.isArray(caps.water_levels) ? caps.water_levels : [];
+
+    if (!modes.includes(this._settings.mode)) {
+      this._settings.mode = modes.includes(caps.preferred_cleaning_mode)
+        ? caps.preferred_cleaning_mode
+        : modes[0];
     }
-    const id = String(room.id);
-    const profile = this._profiles[id] || {};
+    if (suctionLevels.length && !suctionLevels.includes(this._settings.suctionLevel)) {
+      this._settings.suctionLevel = suctionLevels.includes(caps.preferred_suction_level)
+        ? caps.preferred_suction_level
+        : suctionLevels[0];
+    }
+    if (waterLevels.length && !waterLevels.includes(this._settings.waterLevel)) {
+      this._settings.waterLevel = waterLevels.includes(caps.preferred_water_level)
+        ? caps.preferred_water_level
+        : waterLevels[0];
+    }
+    if (![1, 2].includes(Number(this._settings.passes))) this._settings.passes = 1;
+
+    const mode = this._settings.mode || "Vacuum";
+    const supportsMopping = Boolean(caps.supports_mopping);
+    const waterEnabled = supportsMopping && mode !== "Vacuum";
+    const suctionEnabled = mode !== "Mop";
     const key = JSON.stringify({
-      id,
-      profile,
-      modes: caps.cleaning_modes,
-      suction: caps.suction_levels,
-      water: caps.water_levels,
-      mopping: caps.supports_mopping,
-      selected: this._mode === "select" ? [...this._selected].sort() : [],
+      mode,
+      suction: this._settings.suctionLevel,
+      water: this._settings.waterLevel,
+      passes: this._settings.passes,
+      modes,
+      suctionLevels,
+      waterLevels,
+      supportsMopping,
     });
-    if (this._keys.profile === key) return;
-    this._keys.profile = key;
-    const modeOptions = (caps.cleaning_modes || ["Vacuum"]).map((value) => {
-      const selected = this._modeValue(profile) === value ? " selected" : "";
+    if (this._keys.settings === key) return;
+    this._keys.settings = key;
+
+    const modeOptions = modes.map((value) => {
+      const selected = value === mode ? " selected" : "";
+      return `<option value="${this._escapeAttr(value)}"${selected}>${this._escapeHtml(this._cleaningModeLabel(value))}</option>`;
+    }).join("");
+    const suctionOptions = suctionLevels.map((value) => {
+      const selected = String(this._settings.suctionLevel) === value ? " selected" : "";
       return `<option value="${this._escapeAttr(value)}"${selected}>${this._escapeHtml(value)}</option>`;
     }).join("");
-    const suctionOptions = (caps.suction_levels || []).map((value) => {
-      const selected = String(profile.suctionLevel || "") === value ? " selected" : "";
+    const waterOptions = waterLevels.map((value) => {
+      const selected = String(this._settings.waterLevel) === value ? " selected" : "";
       return `<option value="${this._escapeAttr(value)}"${selected}>${this._escapeHtml(value)}</option>`;
     }).join("");
-    const waterOptions = (caps.water_levels || []).map((value) => {
-      const selected = String(profile.waterLevel || "") === value ? " selected" : "";
-      return `<option value="${this._escapeAttr(value)}"${selected}>${this._escapeHtml(value)}</option>`;
-    }).join("");
-    const waterRow = caps.supports_mopping
-      ? `<label>Agua <select data-role="profile-water">${waterOptions}</select></label>`
+    const suctionControl = suctionLevels.length
+      ? `<label>Succión <select data-role="setting-suction"${suctionEnabled ? "" : " disabled"}>${suctionOptions}</select></label>`
       : "";
-    const applySelected = this._mode === "select" && this._selected.size > 1
-      ? `<button data-action="profile-apply-selected">Aplicar a seleccionadas</button>`
+    const waterControl = supportsMopping
+      ? `<label>Agua <select data-role="setting-water"${waterEnabled ? "" : " disabled"}>${waterOptions}</select></label>`
       : "";
-    this._els.profile.innerHTML = `
-      <div class="profile-head">
-        <span class="dot" style="width:10px;height:10px;border-radius:50%;background:${ROOM_COLORS[room.index % ROOM_COLORS.length] || "#4e79a7"}"></span>
-        <span class="name">${this._escapeHtml(room.name || id)}</span>
-        <button data-action="profile-clear">Limpiar</button>
-      </div>
-      <div class="profile-row">
+    this._els.settings.innerHTML = `
+      <div class="settings-head">Ajustes de limpieza</div>
+      <div class="settings-row">
+        <label>Modo <select data-role="setting-mode">${modeOptions}</select></label>
+        ${suctionControl}
+        ${waterControl}
         <label>Pasadas
-          <select data-role="profile-passes">
-            <option value="1"${Number(profile.passes || 1) === 1 ? " selected" : ""}>1</option>
-            <option value="2"${Number(profile.passes || 1) === 2 ? " selected" : ""}>2</option>
+          <select data-role="setting-passes">
+            <option value="1"${Number(this._settings.passes) === 1 ? " selected" : ""}>1</option>
+            <option value="2"${Number(this._settings.passes) === 2 ? " selected" : ""}>2</option>
           </select>
         </label>
-        <label>Modo <select data-role="profile-mode">${modeOptions}</select></label>
-        ${suctionOptions ? `<label>Succión <select data-role="profile-suction">${suctionOptions}</select></label>` : ""}
-        ${waterRow}
       </div>
-      <div class="profile-row">${applySelected}</div>
     `;
-  }
-
-  _modeValue(profile) {
-    if (profile.mode) return profile.mode;
-    if (profile.operatingMode === 1) return "Mop";
-    if (profile.operatingMode === 6 || profile.operatingMode === 3) return "Vacuum + Mop";
-    return "Vacuum";
   }
 
   _updateRoutines(attrs) {
@@ -634,17 +651,6 @@ class RoombaV4MapCard extends HTMLElement {
       this._setMode(target.dataset.mode);
       return;
     }
-    if (action === "profile-clear") {
-      if (this._focusedRoomId) delete this._profiles[String(this._focusedRoomId)];
-      this._saveLocalState();
-      this._keys.profile = null;
-      this._update();
-      return;
-    }
-    if (action === "profile-apply-selected") {
-      this._applyProfileToSelected();
-      return;
-    }
     if (action === "routine-apply") {
       this._applyRoutine();
       return;
@@ -679,17 +685,13 @@ class RoombaV4MapCard extends HTMLElement {
       return;
     }
     const role = target.dataset.role || "";
-    if (!role.startsWith("profile-")) return;
-    const roomId = this._focusedRoomId ? String(this._focusedRoomId) : "";
-    if (!roomId) return;
-    const profile = { ...(this._profiles[roomId] || {}) };
-    if (role === "profile-passes") profile.passes = Number(target.value);
-    else if (role === "profile-mode") profile.mode = target.value;
-    else if (role === "profile-suction") profile.suctionLevel = target.value;
-    else if (role === "profile-water") profile.waterLevel = target.value;
-    this._profiles[roomId] = profile;
+    if (!role.startsWith("setting-")) return;
+    if (role === "setting-mode") this._settings.mode = target.value;
+    else if (role === "setting-suction") this._settings.suctionLevel = target.value;
+    else if (role === "setting-water") this._settings.waterLevel = target.value;
+    else if (role === "setting-passes") this._settings.passes = Number(target.value);
     this._saveLocalState();
-    this._keys.profile = null;
+    this._keys.settings = null;
     this._update();
   }
 
@@ -697,12 +699,10 @@ class RoombaV4MapCard extends HTMLElement {
     if (this._mode === "all") {
       this._mode = "select";
       this._selected = new Set([id]);
-      this._focusedRoomId = id;
+    } else if (this._selected.has(id)) {
+      this._selected.delete(id);
     } else {
-      if (this._selected.has(id)) this._selected.delete(id);
-      else this._selected.add(id);
-      if (this._mode === "select") this._focusedRoomId = id;
-      else this._focusedRoomId = null;
+      this._selected.add(id);
     }
     this._saveLocalState();
     this._keys = {};
@@ -712,18 +712,6 @@ class RoombaV4MapCard extends HTMLElement {
   _setMode(mode) {
     if (!["all", "select", "exclude"].includes(mode)) return;
     this._mode = mode;
-    if (mode === "exclude") this._focusedRoomId = null;
-    this._saveLocalState();
-    this._keys = {};
-    this._update();
-  }
-
-  _applyProfileToSelected() {
-    const sourceId = this._focusedRoomId ? String(this._focusedRoomId) : "";
-    if (!sourceId || !this._profiles[sourceId]) return;
-    this._selected.forEach((id) => {
-      this._profiles[id] = { ...this._profiles[sourceId] };
-    });
     this._saveLocalState();
     this._keys = {};
     this._update();
@@ -742,8 +730,12 @@ class RoombaV4MapCard extends HTMLElement {
     }
     this._mode = ["all", "select", "exclude"].includes(config.mode) ? config.mode : "select";
     this._selected = new Set((config.rooms || []).map(String));
-    this._profiles = config.profiles && typeof config.profiles === "object" ? config.profiles : {};
-    this._focusedRoomId = this._selected.size ? String([...this._selected][0]) : null;
+    if (config.settings && typeof config.settings === "object") {
+      this._settings = { ...config.settings };
+    } else if (config.profiles && typeof config.profiles === "object") {
+      const legacy = Object.values(config.profiles).find((value) => value && typeof value === "object");
+      this._settings = legacy ? { ...legacy } : {};
+    }
     this._saveLocalState();
     this._keys = {};
     this._update();
@@ -757,7 +749,7 @@ class RoombaV4MapCard extends HTMLElement {
     const config = {
       mode: this._mode,
       rooms: [...this._selected],
-      profiles: this._profiles,
+      settings: this._settings,
     };
     await this._callService("save_routine", { name, config });
     this._selectedRoutine = name;
@@ -789,11 +781,8 @@ class RoombaV4MapCard extends HTMLElement {
       this._setNotice("No hay habitaciones para limpiar", true);
       return;
     }
-    const rooms = ids.map((id) => ({
-      room: id,
-      settings: this._profiles[id] || {},
-    }));
-    await this._callService("clean_rooms", { rooms });
+    const rooms = ids.map((id) => String(id));
+    await this._callService("clean_rooms", { rooms, settings: this._settings });
   }
 
   async _mission(command) {
