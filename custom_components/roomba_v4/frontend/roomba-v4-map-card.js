@@ -616,7 +616,16 @@ class RoombaV4MapCard extends HTMLElement {
 
   _updateProgress(attrs) {
     const plan = attrs.active_plan;
-    if (!plan || !Array.isArray(plan.rooms) || !plan.rooms.length) {
+    // Only show progress for a plan that is actually running. A finished (or
+    // otherwise inactive) plan may linger in the attributes, but there is no
+    // cleaning in progress, so it must not be rendered.
+    const activeStatuses = ["starting", "cleaning", "paused", "returning"];
+    const isActive =
+      plan &&
+      Array.isArray(plan.rooms) &&
+      plan.rooms.length &&
+      activeStatuses.includes(String(plan.status || ""));
+    if (!isActive) {
       if (this._keys.progress !== "hidden") {
         this._keys.progress = "hidden";
         this._els.progress.innerHTML = "";

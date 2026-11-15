@@ -1979,6 +1979,11 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         plan["remaining_room_ids"] = [room_id for room_id in room_ids if room_id not in completed and room_id != current]
         if len(plan["completed_room_ids"]) >= len(room_ids) and state in {"docked", "charging", "idle"}:
             plan["status"] = "finished"
+        # A finished plan is no longer an active mission. Drop it so it is not
+        # persisted and later restored as a stale "0/N" progress bar when no
+        # cleaning is in progress.
+        if plan.get("status") == "finished":
+            self.active_plan = None
 
     def _finish_active_plan(self) -> None:
         plan = self.active_plan
@@ -1995,6 +2000,9 @@ class RoombaV4Coordinator(DataUpdateCoordinator[dict]):
         plan["current_room_name"] = None
         plan["remaining_room_ids"] = [room_id for room_id in room_ids if room_id not in completed]
         plan["status"] = "finished"
+        # The mission is over; drop the plan so stale progress is not persisted
+        # or restored when no cleaning is in progress.
+        self.active_plan = None
 
     def _resolve_room_by_selection(self, selection: Any) -> dict[str, Any] | None:
         value = str(selection or "").strip()
